@@ -6,26 +6,18 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// 🔐 Kayako OAuth credentials from Render environment variables
-const KAYAKO_BASE_URL = 'https://stickershop.kayako.com'; // 👈 Update to your Kayako URL
-const CLIENT_ID = process.env.KAYAKO_CLIENT_ID;
-const CLIENT_SECRET = process.env.KAYAKO_CLIENT_SECRET;
+const KAYAKO_BASE_URL = 'https://stickershop.kayako.com'; // 👈 Replace with yours
 
-let accessToken = null;
-let tokenExpiry = null;
-
-// ✅ Fetch Kayako access token using client credentials
+// 🔐 Password Grant Auth
 async function getAccessToken() {
   const response = await axios.post(`${KAYAKO_BASE_URL}/api/v1/token`, new URLSearchParams({
     grant_type: 'password',
     username: process.env.KAYAKO_USERNAME,
     password: process.env.KAYAKO_PASSWORD
   }));
-
   return response.data.access_token;
 }
 
-// ✅ Handle WhatsApp webhook from Twilio
 app.post('/incoming-whatsapp', async (req, res) => {
   const from = req.body.From;
   const body = req.body.Body;
@@ -58,11 +50,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
   }
 });
 
-// Optional: fallback route to test Render is live
-app.get('/', (req, res) => {
-  res.send("Webhook is running ✅");
-});
+app.get('/', (req, res) => res.send("Webhook is running ✅"));
 
-// 🔄 Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Webhook server running on port ${PORT}`));
