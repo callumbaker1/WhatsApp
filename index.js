@@ -41,7 +41,6 @@ async function getSessionAuth() {
   }
 }
 
-
 async function findOrCreateUser(email, name, authHeaders) {
   try {
     const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
@@ -49,10 +48,13 @@ async function findOrCreateUser(email, name, authHeaders) {
       return searchResponse.data[0].id;
     }
 
-    // User not found — create one
+    // Required role_id for customers is usually 1 in Kayako
+    const role_id = 1;
+
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
-      primary_email: email
+      emails: [email], // Use correct array format for emails
+      role_id: role_id
     }, authHeaders);
 
     return createResponse.data.id;
