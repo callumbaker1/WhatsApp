@@ -13,17 +13,26 @@ const KAYAKO_BASE_URL = 'https://stickershop.kayako.com/api/v1';
 async function startKayakoSession() {
   const auth = Buffer.from(`${process.env.KAYAKO_USERNAME}:${process.env.KAYAKO_PASSWORD}`).toString('base64');
 
-  const sessionResponse = await axios.get(`${KAYAKO_BASE_URL}/cases.json`, {
-    headers: {
-      Authorization: `Basic ${auth}`,
-      'Content-Type': 'application/json'
+  try {
+    const sessionResponse = await axios.get(`${KAYAKO_BASE_URL}/cases.json`, {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const session_id = sessionResponse.headers['set-cookie']?.find(c => c.includes('session_id'))?.split(';')[0]?.split('=')[1];
+    const csrfToken = sessionResponse.headers['x-csrf-token'];
+
+    if (!session_id || !csrfToken) {
+      throw new Error('Missing session_id or CSRF token');
     }
-  });
 
-  const session_id = sessionResponse.data.session_id;
-  const csrfToken = sessionResponse.headers['x-csrf-token'];
-
-  return { session_id, csrfToken };
+    return { session_id, csrfToken };
+  } catch (err) {
+    console.error('Auth error:', err.message || err);
+    throw new Error('Authentication failed');
+  }
 }
 
 app.post('/incoming-whatsapp', async (req, res) => {
