@@ -60,7 +60,7 @@ async function findOrCreateUser(email, name, authHeaders) {
       full_name: name,
       email,
       role_id: 1,       // Assuming default user role
-      team_ids: [1]     // Replace `1` with your real Kayako team ID
+      team_ids: 1     // Replace `1` with your real Kayako team ID
     }, authHeaders);
 
     return createResponse.data.id;
