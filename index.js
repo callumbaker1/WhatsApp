@@ -41,6 +41,26 @@ async function getSessionAuth() {
   }
 }
 
+async function findOrCreateUser(email, name, authHeaders) {
+  try {
+    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
+    if (searchResponse.data && searchResponse.data.length > 0) {
+      return searchResponse.data[0].id;
+    }
+
+    // User not found — create one
+    const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
+      full_name: name,
+      primary_email: email
+    }, authHeaders);
+
+    return createResponse.data.id;
+  } catch (error) {
+    console.error("❌ User search/create error:", error.response?.data || error.message);
+    return null;
+  }
+}
+
 app.post('/incoming-whatsapp', async (req, res) => {
   const from = req.body.From;
   const message = req.body.Body;
