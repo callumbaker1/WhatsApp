@@ -22,19 +22,15 @@ app.post('/incoming-whatsapp', async (req, res) => {
   try {
     await axios.post(`${KAYAKO_BASE_URL}/api/v1/cases.json`, {
       subject: `WhatsApp from ${from}`,
-      requester: {
-        name: from,
-        email: `${from.replace(/\D/g, '')}@stickershop.fake`
-      },
       contents: [
         {
-          channel: "email",
+          content_type: "text/html",
           body: body
         }
       ]
     }, {
       headers: {
-        Authorization: authHeader,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json'
       }
     });
