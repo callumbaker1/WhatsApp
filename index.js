@@ -24,7 +24,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       subject: `WhatsApp from ${from}`,
       contents: [
         {
-          content_type: "text/html",
+          content_type: "text/plain",
           body: body
         }
       ]
