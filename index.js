@@ -6,27 +6,20 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-const KAYAKO_BASE_URL = 'https://stickershop.kayako.com'; // 👈 Replace with yours
+const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
+const KAYAKO_USERNAME = process.env.KAYAKO_USERNAME || 'hello@stickershop.co.uk';
+const KAYAKO_PASSWORD = process.env.KAYAKO_PASSWORD || 'Sunnyside25*';
 
-// 🔐 Password Grant Auth
-async function getAccessToken() {
-  const response = await axios.post(`${KAYAKO_BASE_URL}/api/v1/token`, new URLSearchParams({
-    grant_type: 'password',
-    username: process.env.KAYAKO_USERNAME,
-    password: process.env.KAYAKO_PASSWORD
-  }));
-  return response.data.access_token;
-}
+// 🔐 Basic Auth Header
+const authHeader = 'Basic ' + Buffer.from(`${KAYAKO_USERNAME}:${KAYAKO_PASSWORD}`).toString('base64');
 
 app.post('/incoming-whatsapp', async (req, res) => {
   const from = req.body.From;
   const body = req.body.Body;
 
-  console.log(`WhatsApp from ${from}: ${body}`);
+  console.log(`✉️ WhatsApp from ${from}: ${body}`);
 
   try {
-    const token = await getAccessToken();
-
     await axios.post(`${KAYAKO_BASE_URL}/api/v1/tickets`, {
       subject: `WhatsApp from ${from}`,
       requester: {
@@ -37,12 +30,12 @@ app.post('/incoming-whatsapp', async (req, res) => {
       content: body
     }, {
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: authHeader,
         'Content-Type': 'application/json'
       }
     });
 
-    console.log("✅ Ticket successfully created");
+    console.log("🌟 Ticket successfully created");
     res.send('<Response></Response>');
   } catch (error) {
     console.error("❌ Ticket creation failed:", error.response?.data || error.message);
@@ -53,4 +46,4 @@ app.post('/incoming-whatsapp', async (req, res) => {
 app.get('/', (req, res) => res.send("Webhook is running ✅"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Webhook server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
