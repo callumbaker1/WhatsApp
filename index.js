@@ -62,7 +62,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
     const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
       subject: `New WhatsApp message from ${from}`,
       channel: "EMAIL",
-      requester_id: null, // Let Kayako find or assign based on email
+      requester: email, // Let Kayako find or assign based on email
       contents: [{
         type: "text",
         body: message
