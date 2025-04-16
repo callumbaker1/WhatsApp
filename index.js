@@ -1,73 +1,85 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-require('dotenv').config(); // only works locally; for Render, use environment variables panel
+const dotenv = require('dotenv');
+dotenv.config();
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
-const KAYAKO_API_VERSION = 'v1';
-const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/${KAYAKO_API_VERSION}`;
+const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/v1`;
 
-// 🔐 Session-based authentication (basic login to get session + CSRF token)
-// 🔐 Session-based authentication (username/password → session_id + CSRF)
 async function getSessionAuth() {
-  const authString = Buffer.from(`${process.env.KAYAKO_USERNAME}:${process.env.KAYAKO_PASSWORD}`).toString('base64');
-
-  const sessionResponse = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
-    headers: {
-      Authorization: `Basic ${authString}`,
-      'Content-Type': 'application/json'
-    }
-  });
-
-  // Debug logs
-  console.log('🔍 Headers:', sessionResponse.headers);
-  console.log('🔍 Data:', sessionResponse.data);
-
-  const csrf_token = sessionResponse.headers['x-csrf-token'];
-  const session_id = sessionResponse.data.session_id;
-
-  if (!session_id) {
-    throw new Error('❌ session_id missing from Kayako response body');
-  }
-  if (!csrf_token) {
-    throw new Error('❌ CSRF token missing from response headers');
-  }
-
-  return { session_id, csrf_token };
-}
-
-// ✅ Incoming WhatsApp webhook
-app.post('/incoming-whatsapp', async (req, res) => {
-  const from = req.body.From;
-  const body = req.body.Body;
-
-  console.log(`📩 WhatsApp from ${from}: ${body}`);
-
   try {
-    const { session_id, csrf_token } = await getSessionAuth();
-
-    // Create ticket
-    const response = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
-      subject: `WhatsApp from ${from}`,
-      channel_id: 1, // You may need to set a valid channel_id
-      contents: [{
-        body: body,
-        content_type: "plaintext"
-      }],
-      requester_id: 1 // You'll likely need to map/create users and provide a valid ID
-    }, {
+    const response = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
+      auth: {
+        username: process.env.KAYAKO_USERNAME,
+        password: process.env.KAYAKO_PASSWORD
+      },
       headers: {
-        Cookie: `session_id=${session_id}`,
-        'X-CSRF-Token': csrf_token,
         'Content-Type': 'application/json'
       }
     });
 
-    console.log("✅ Ticket successfully created:", response.data);
+    const csrf_token = response.headers['x-csrf-token'];
+    const session_id = response.data.session_id;
+
+    if (!csrf_token || !session_id) {
+      console.error('❌ Missing CSRF token or session_id');
+      return null;
+    }
+
+    return {
+      csrf_token,
+      session_id
+    };
+  } catch (error) {
+    console.error("❌ Auth error:", error.message);
+    return null;
+  }
+}
+
+app.post('/incoming-whatsapp', async (req, res) => {
+  const from = req.body.From;
+  const message = req.body.Body;
+
+  console.log(`📩 WhatsApp from ${from}: ${message}`);
+
+  const session = await getSessionAuth();
+
+  if (!session) {
+    console.error('❌ Ticket creation failed: Authentication failed');
+    return res.status(500).send("Auth failed");
+  }
+
+  const { csrf_token, session_id } = session;
+
+  const email = `${from.replace(/\D/g, '')}@whatsapp.stickershop.co.uk`;
+
+  try {
+    const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
+      subject: `New WhatsApp message from ${from}`,
+      channel: "EMAIL",
+      requester_id: null, // Let Kayako find or assign based on email
+      contents: [{
+        type: "text",
+        body: message
+      }]
+    }, {
+      headers: {
+        'X-CSRF-Token': csrf_token,
+        'Cookie': `kayako_session_id=${session_id}`,
+        'Content-Type': 'application/json'
+      },
+      auth: {
+        username: process.env.KAYAKO_USERNAME,
+        password: process.env.KAYAKO_PASSWORD
+      }
+    });
+
+    console.log("✅ Ticket successfully created:", ticketResponse.data);
     res.send('<Response></Response>');
   } catch (error) {
     console.error("❌ Ticket creation failed:", error.response?.data || error.message);
