@@ -48,14 +48,15 @@ async function findOrCreateUser(email, name, authHeaders) {
       return searchResponse.data[0].id;
     }
 
-    const role_id = 1; // standard customer role
-    const team_ids = []; // or you can add an actual team ID if required later
+    const role_id = 1; // Standard user role
+    const team_ids = [1]; // 🔁 Replace `1` with your actual team ID
 
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
-      emails: [email],
+      email,                // required field (string)
+      emails: [email],      // also needed
       role_id,
-      team_ids
+      team_ids              // MUST contain at least one ID
     }, authHeaders);
 
     return createResponse.data.id;
