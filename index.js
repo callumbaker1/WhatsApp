@@ -1,8 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const dotenv = require('dotenv');
-dotenv.config();
+require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -10,63 +9,66 @@ app.use(bodyParser.json());
 
 const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
 const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/v1`;
+const KAYAKO_USERNAME = process.env.KAYAKO_USERNAME;
+const KAYAKO_PASSWORD = process.env.KAYAKO_PASSWORD;
 
-async function getSessionAuth() {
+// 🛡 Get Session ID + CSRF Token
+async function getSession() {
   try {
     const response = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
       auth: {
-        username: process.env.KAYAKO_USERNAME,
-        password: process.env.KAYAKO_PASSWORD
-      },
-      headers: {
-        'Content-Type': 'application/json'
+        username: KAYAKO_USERNAME,
+        password: KAYAKO_PASSWORD
       }
     });
 
-    const csrf_token = response.headers['x-csrf-token'];
-    const session_id = response.data.session_id;
+    const cookies = response.headers['set-cookie'] || [];
+    const sessionCookie = cookies.find(c => c.includes('kayako_session_id='));
 
-    if (!csrf_token || !session_id) {
-      console.error('❌ Missing CSRF token or session_id');
+    if (!sessionCookie) {
+      console.error('❌ Missing session cookie');
       return null;
     }
 
-    return {
-      csrf_token,
-      session_id
-    };
+    const session_id = sessionCookie
+      .split(';')[0]
+      .split('=')[1];
+
+    const csrf_token = response.headers['x-csrf-token'];
+    return { session_id, csrf_token };
   } catch (error) {
-    console.error("❌ Auth error:", error.message);
+    console.error('❌ Auth error:', error.message);
     return null;
   }
 }
 
+// 📬 Incoming WhatsApp Webhook
 app.post('/incoming-whatsapp', async (req, res) => {
   const from = req.body.From;
   const message = req.body.Body;
+  const fakeEmail = `${from.replace(/\D/g, '')}@whatsapp.fake`;
 
   console.log(`📩 WhatsApp from ${from}: ${message}`);
 
-  const session = await getSessionAuth();
-
+  const session = await getSession();
   if (!session) {
-    console.error('❌ Ticket creation failed: Authentication failed');
-    return res.status(500).send("Auth failed");
+    console.error('❌ Ticket creation failed: Missing session_id or cookie in response');
+    return res.status(500).send('Authentication failed');
   }
 
-  const { csrf_token, session_id } = session;
-
-  const email = `${from.replace(/\D/g, '')}@whatsapp.stickershop.co.uk`;
+  const { session_id, csrf_token } = session;
 
   try {
-    const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
-      subject: `New WhatsApp message from ${from}`,
+    await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
+      subject: `WhatsApp message from ${from}`,
       channel: "EMAIL",
-      requester: email, // Let Kayako find or assign based on email
-      contents: [{
-        type: "text",
-        body: message
-      }]
+      requester: fakeEmail,
+      contents: [
+        {
+          type: "text",
+          body: message
+        }
+      ]
     }, {
       headers: {
         'X-CSRF-Token': csrf_token,
@@ -74,20 +76,22 @@ app.post('/incoming-whatsapp', async (req, res) => {
         'Content-Type': 'application/json'
       },
       auth: {
-        username: process.env.KAYAKO_USERNAME,
-        password: process.env.KAYAKO_PASSWORD
+        username: KAYAKO_USERNAME,
+        password: KAYAKO_PASSWORD
       }
     });
 
-    console.log("✅ Ticket successfully created:", ticketResponse.data);
+    console.log('✅ Ticket successfully created');
     res.send('<Response></Response>');
   } catch (error) {
-    console.error("❌ Ticket creation failed:", error.response?.data || error.message);
-    res.status(500).send("Ticket creation failed");
+    const data = error.response?.data || error.message;
+    console.error('❌ Ticket creation failed:', data);
+    res.status(500).send('Ticket creation failed');
   }
 });
 
-app.get('/', (req, res) => res.send("Webhook is running ✅"));
+// 🧪 Test endpoint
+app.get('/', (req, res) => res.send("✅ WhatsApp webhook is running"));
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
