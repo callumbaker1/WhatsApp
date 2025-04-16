@@ -41,6 +41,7 @@ async function getSessionAuth() {
   }
 }
 
+
 async function findOrCreateUser(email, name, authHeaders) {
   try {
     const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
@@ -68,7 +69,6 @@ app.post('/incoming-whatsapp', async (req, res) => {
   console.log(`📩 WhatsApp from ${from}: ${message}`);
 
   const session = await getSessionAuth();
-
   if (!session) {
     console.error('❌ Ticket creation failed: Authentication failed');
     return res.status(500).send("Auth failed");
@@ -77,27 +77,38 @@ app.post('/incoming-whatsapp', async (req, res) => {
   const { csrf_token, session_id } = session;
 
   const email = `${from.replace(/\D/g, '')}@whatsapp.stickershop.co.uk`;
+  const name = from;
+
+  const authHeaders = {
+    headers: {
+      'X-CSRF-Token': csrf_token,
+      'Cookie': `kayako_session_id=${session_id}`,
+      'Content-Type': 'application/json'
+    },
+    auth: {
+      username: process.env.KAYAKO_USERNAME,
+      password: process.env.KAYAKO_PASSWORD
+    }
+  };
+
+  const requester_id = await findOrCreateUser(email, name, authHeaders);
+
+  if (!requester_id) {
+    return res.status(500).send("User lookup/creation failed");
+  }
 
   try {
     const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
       subject: `New WhatsApp message from ${from}`,
-      channel: "EMAIL",
-      requester_id: null, // Let Kayako find or assign based on email
-      contents: [{
-        type: "text",
-        body: message
-      }]
-    }, {
-      headers: {
-        'X-CSRF-Token': csrf_token,
-        'Cookie': `kayako_session_id=${session_id}`,
-        'Content-Type': 'application/json'
-      },
-      auth: {
-        username: process.env.KAYAKO_USERNAME,
-        password: process.env.KAYAKO_PASSWORD
-      }
-    });
+      channel: "email",
+      requester_id,
+      contents: [
+        {
+          type: "text",
+          body: message
+        }
+      ]
+    }, authHeaders);
 
     console.log("✅ Ticket successfully created:", ticketResponse.data);
     res.send('<Response></Response>');
