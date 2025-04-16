@@ -3,24 +3,24 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 const app = express();
 
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-
-const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
+// 🛠 Update with your actual Kayako credentials or use environment variables
 const KAYAKO_USERNAME = process.env.KAYAKO_USERNAME || 'hello@stickershop.co.uk';
 const KAYAKO_PASSWORD = process.env.KAYAKO_PASSWORD || 'Sunnyside25*';
+const KAYAKO_BASE_URL = 'https://stickershop.kayako.com/api/v1';
 
-// 🔐 Basic Auth Header
-const authHeader = 'Basic ' + Buffer.from(`${KAYAKO_USERNAME}:${KAYAKO_PASSWORD}`).toString('base64');
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
 app.post('/incoming-whatsapp', async (req, res) => {
   const from = req.body.From;
   const body = req.body.Body;
 
-  console.log(`✉️ WhatsApp from ${from}: ${body}`);
+  console.log(`📩 WhatsApp from ${from}: ${body}`);
+
+  const authHeader = 'Basic ' + Buffer.from(`${KAYAKO_USERNAME}:${KAYAKO_PASSWORD}`).toString('base64');
 
   try {
-    await axios.post(`${KAYAKO_BASE_URL}/api/v1/tickets`, {
+    await axios.post(`${KAYAKO_BASE_URL}/cases.json`, {
       subject: `WhatsApp from ${from}`,
       requester: {
         name: from,
@@ -35,7 +35,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       }
     });
 
-    console.log("🌟 Ticket successfully created");
+    console.log("✅ Ticket successfully created");
     res.send('<Response></Response>');
   } catch (error) {
     console.error("❌ Ticket creation failed:", error.response?.data || error.message);
