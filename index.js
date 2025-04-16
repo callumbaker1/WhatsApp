@@ -44,19 +44,23 @@ async function getSessionAuth() {
 async function findOrCreateUser(email, name, authHeaders) {
   try {
     const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
+
     if (searchResponse.data && searchResponse.data.length > 0) {
-      return searchResponse.data[0].id;
+      const user = searchResponse.data.find(u =>
+        u.primary_email === email ||
+        (u.emails && u.emails.includes(email))
+      );
+      if (user) {
+        return user.id;
+      }
     }
 
-    const role_id = 1; // Standard user role
-    const team_ids = 3; // 🔁 Replace `1` with your actual team ID
-
+    // If not found, create new user
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
-      email,                // required field (string)
-      emails: [email],      // also needed
-      role_id,
-      team_ids              // MUST contain at least one ID
+      email,
+      role_id: 1,       // Assuming default user role
+      team_ids: [1]     // Replace `1` with your real Kayako team ID
     }, authHeaders);
 
     return createResponse.data.id;
