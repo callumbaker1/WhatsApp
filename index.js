@@ -49,7 +49,7 @@ async function findOrCreateUser(email, name, authHeaders) {
     }
 
     const role_id = 1; // Standard user role
-    const team_ids = [1]; // 🔁 Replace `1` with your actual team ID
+    const team_ids = [3]; // 🔁 Replace `1` with your actual team ID
 
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
