@@ -16,19 +16,13 @@ let tokenExpiry = null;
 
 // ✅ Fetch Kayako access token using client credentials
 async function getAccessToken() {
-  if (accessToken && tokenExpiry && Date.now() < tokenExpiry) {
-    return accessToken; // Reuse cached token
-  }
-
   const response = await axios.post(`${KAYAKO_BASE_URL}/api/v1/token`, new URLSearchParams({
-    grant_type: 'client_credentials',
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET
+    grant_type: 'password',
+    username: process.env.KAYAKO_USERNAME,
+    password: process.env.KAYAKO_PASSWORD
   }));
 
-  accessToken = response.data.access_token;
-  tokenExpiry = Date.now() + (response.data.expires_in * 1000) - 60000; // buffer time
-  return accessToken;
+  return response.data.access_token;
 }
 
 // ✅ Handle WhatsApp webhook from Twilio
