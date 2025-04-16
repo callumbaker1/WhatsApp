@@ -7,7 +7,7 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 // Use env vars in Render for credentials
-const KAYAKO_API_URL = 'https://yourkayako.com/api/v1';
+const KAYAKO_API_URL = 'https://stickershop.kayako.com/api/v1';
 const KAYAKO_API_USER = process.env.KAYAKO_API_USER;
 const KAYAKO_API_PASS = process.env.KAYAKO_API_PASS;
 
