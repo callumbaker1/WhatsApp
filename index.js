@@ -12,6 +12,7 @@ const KAYAKO_API_VERSION = 'v1';
 const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/${KAYAKO_API_VERSION}`;
 
 // 🔐 Session-based authentication (basic login to get session + CSRF token)
+// 🔐 Session-based authentication (username/password → session_id + CSRF)
 async function getSessionAuth() {
   const authString = Buffer.from(`${process.env.KAYAKO_USERNAME}:${process.env.KAYAKO_PASSWORD}`).toString('base64');
 
@@ -22,22 +23,18 @@ async function getSessionAuth() {
     }
   });
 
-  // Debug logs:
+  // Debug logs
   console.log('🔍 Headers:', sessionResponse.headers);
   console.log('🔍 Data:', sessionResponse.data);
 
-  const cookies = sessionResponse.headers['set-cookie'];
-  const session_id = cookies?.find(c => c.includes('session_id'))?.split(';')[0]?.split('=')[1];
-
-  if (!cookies || !session_id) {
-    console.error("❌ Missing set-cookie headers or session_id");
-    throw new Error('Missing session_id or cookie in response');
-  }
-
   const csrf_token = sessionResponse.headers['x-csrf-token'];
+  const session_id = sessionResponse.data.session_id;
+
+  if (!session_id) {
+    throw new Error('❌ session_id missing from Kayako response body');
+  }
   if (!csrf_token) {
-    console.error("❌ Missing CSRF token in headers");
-    throw new Error('Missing CSRF token');
+    throw new Error('❌ CSRF token missing from response headers');
   }
 
   return { session_id, csrf_token };
