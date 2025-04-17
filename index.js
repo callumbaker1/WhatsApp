@@ -43,34 +43,24 @@ async function getSessionAuth() {
 
 async function findOrCreateUser(email, name, authHeaders) {
   try {
-    // 🔍 Try to find the user
+    // 1. Search for the user first
     const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
+    const users = searchResponse.data;
 
-    if (searchResponse.data && searchResponse.data.length > 0) {
-      console.log("👤 Found existing user:", searchResponse.data[0].id);
-      return searchResponse.data[0].id;
+    if (Array.isArray(users) && users.length > 0) {
+      return users[0].id; // ✅ Found user
     }
 
-    // ✳️ If not found, create one
+    // 2. If not found, create user
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
-      email,
-      role_id: 1,
-      team_ids: [1]
+      primary_email: email,
+      role_id: 3,           // Set to "User"
+      team_ids: 3         // Assign to "Enquiries" team
     }, authHeaders);
 
     return createResponse.data.id;
-
   } catch (error) {
-    if (error.response?.data?.errors?.some(e => e.code === "FIELD_DUPLICATE")) {
-      // 🛑 If it's a duplicate email, search again and return that ID
-      const retrySearch = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
-      if (retrySearch.data && retrySearch.data.length > 0) {
-        console.log("🔁 Resolved duplicate by returning existing user ID:", retrySearch.data[0].id);
-        return retrySearch.data[0].id;
-      }
-    }
-
     console.error("❌ User search/create error:", error.response?.data || error.message);
     return null;
   }
