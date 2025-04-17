@@ -43,32 +43,23 @@ async function getSessionAuth() {
 
 async function findOrCreateUser(email, name, authHeaders) {
   try {
-    const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
-      subject: `New WhatsApp message from ${from}`,
-      channel: "email",
-      requester_id,
-      team_ids: [1], // 💡 this might be required!
-      contents: [
-        {
-          type: "text",
-          body: message
-        }
-      ]
-    }, authHeaders);
-  
-    console.log("✅ Ticket successfully created:", ticketResponse.data);
-    res.send('<Response></Response>');
-  } catch (error) {
-    console.error("❌ Ticket creation failed:");
-    if (error.response) {
-      console.error("🔻 Response data:", error.response.data);
-      console.error("🔻 Status code:", error.response.status);
-      console.error("🔻 Headers:", error.response.headers);
-    } else {
-      console.error("🔻 Error message:", error.message);
+    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
+    if (searchResponse.data && searchResponse.data.length > 0) {
+      return searchResponse.data[0].id;
     }
-  
-    res.status(500).send("Ticket creation failed");
+
+    // User not found — create one
+    const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
+      full_name: name,
+      primary_email: email,
+      role_id: 4,
+      team_ids: [1]
+    }, authHeaders);
+
+    return createResponse.data.id;
+  } catch (error) {
+    console.error("❌ User search/create error:", error.response?.data || error.message);
+    return null; // ✅ Let the main route handler handle failure
   }
 }
 
