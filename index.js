@@ -55,7 +55,7 @@ async function findOrCreateUser(email, name, authHeaders) {
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
       primary_email: email,
-      role_id: 3,           // Set to "User"
+      role_id: 4,           // Set to "User"
       team_ids: 3         // Assign to "Enquiries" team
     }, authHeaders);
 
