@@ -53,7 +53,7 @@ async function findOrCreateUser(email, name, authHeaders) {
       full_name: name,
       primary_email: email,
       role_id: 4,
-      team_ids: [1]
+      team_ids: 1
     }, authHeaders);
 
     return createResponse.data.id;
