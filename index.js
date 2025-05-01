@@ -131,6 +131,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       team_id: 3,
       contents: [
         {
+          channel: "helpcenter", // ✅ REQUIRED here
           type: "text",
           body: message
         }
