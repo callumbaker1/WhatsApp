@@ -128,9 +128,11 @@ app.post('/incoming-whatsapp', async (req, res) => {
     const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
       subject: `New WhatsApp message from ${from}`,
       requester_id,
-      team_ids: [3], // Replace with your actual support team ID
+      team_id: 3, // ✅ use `team_id`, not `team_ids`
+      channel: "email", // ✅ required field (or use "messenger" if preferred)
       contents: [
         {
+          channel: "email", // ✅ required inside contents too
           type: "text",
           body: message
         }
