@@ -60,10 +60,11 @@ async function findOrCreateUser(email, name, authHeaders) {
       full_name: name,
       primary_email: email,
       role_id: 4,
-      team_ids: 3
+      team_id: 3,
+      emails: [email] // ✅ This actually adds the email to the user profile
     }, authHeaders);
 
-    console.log("✅ User created:", createResponse.data.id);
+    console.log("✅ User created:", createResponse.data?.id || '[no ID returned]');
     return createResponse.data.id;
 
   } catch (error) {
