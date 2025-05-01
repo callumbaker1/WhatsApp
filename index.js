@@ -125,20 +125,22 @@ app.post('/incoming-whatsapp', async (req, res) => {
   console.log("✅ Requester ID found or created:", requester_id);
 
   try {
-    const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
+    const ticketPayload = {
       subject: `New WhatsApp message from ${from}`,
       requester_id,
-      team_id: 3, // ✅ correct placement
+      team_id: 3,
       contents: [
         {
-          channel: "helpcenter", // ✅ this is required
+          channel: "helpcenter",
           type: "text",
           body: message
         }
       ]
-    }, authHeaders);
-
+    };
+    
     console.log("📦 Payload to Kayako:\n", JSON.stringify(ticketPayload, null, 2)); // ← log payload
+    
+    const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, ticketPayload, authHeaders);
 
     console.log("✅ Ticket successfully created:", ticketResponse.data);
     res.send('<Response></Response>');
