@@ -57,14 +57,15 @@ async function findOrCreateUser(email, name, authHeaders) {
     console.log("👤 User not found, creating new one...");
 
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
-      full_name: name,
-      role_id: 4,
-      team_id: 3,
-      emails: [
-        {
-          email: email
-        }
-      ]
+      full_name: from, // e.g. "whatsapp:+447949558235"
+      identities: {
+        emails: [
+          {
+            email: email, // e.g. "447949558235@whatsapp.stickershop.co.uk"
+            is_primary: true
+          }
+        ]
+      }
     }, authHeaders);
 
     // ✅ Safely extract the new user ID
