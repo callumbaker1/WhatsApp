@@ -129,10 +129,10 @@ app.post('/incoming-whatsapp', async (req, res) => {
       subject: `New WhatsApp message from ${from}`,
       requester_id,
       team_id: 3, // ✅ use `team_id`, not `team_ids`
-      channel: "email", // ✅ required field (or use "messenger" if preferred)
+      channel: "messenger", // ✅ required field (or use "messenger" if preferred)
       contents: [
         {
-          channel: "email", // ✅ required inside contents too
+          channel: "messenger", // ✅ required inside contents too
           type: "text",
           body: message
         }
