@@ -46,23 +46,29 @@ console.log("🍪 Session ID:", session_id);
 
 async function findOrCreateUser(email, name, authHeaders) {
   try {
+    console.log("🔍 Searching for user with email:", email);
     const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
+    
     if (searchResponse.data && searchResponse.data.length > 0) {
+      console.log("✅ User found:", searchResponse.data[0].id);
       return searchResponse.data[0].id;
     }
 
-    // User not found — create one
+    console.log("👤 User not found, creating new one...");
+
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
       primary_email: email,
       role_id: 4,
-      team_ids: 1
+      team_ids: 3
     }, authHeaders);
 
+    console.log("✅ User created:", createResponse.data.id);
     return createResponse.data.id;
+
   } catch (error) {
     console.error("❌ User search/create error:", error.response?.data || error.message);
-    return null; // ✅ Let the main route handler handle failure
+    return null;
   }
 }
 
