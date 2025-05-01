@@ -47,18 +47,20 @@ console.log("🍪 Session ID:", session_id);
 async function findOrCreateUser(email, name, authHeaders) {
   try {
     console.log("🔍 Searching for user with email:", email);
-    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${email}&resources=users`, authHeaders);
+    const searchResponse = await axios.get(
+      `${KAYAKO_API_BASE}/search.json?q=${encodeURIComponent(email)}&resources=users`,
+      authHeaders
+    );
 
     const users = searchResponse.data?.data || [];
 
-    if (users.length > 0) {
-      const matchedUser = users.find(u =>
-        (u.emails || []).some(e => e.email === email)
-      );
-      if (matchedUser) {
-        console.log("✅ Exact user match found:", matchedUser.id);
-        return matchedUser.id;
-      }
+    const matchedUser = users.find(u =>
+      (u.emails || []).some(e => e.email === email)
+    );
+
+    if (matchedUser) {
+      console.log("✅ Exact user match found:", matchedUser.id);
+      return matchedUser.id;
     }
 
     console.log("👤 User not found, creating new one...");
@@ -66,10 +68,9 @@ async function findOrCreateUser(email, name, authHeaders) {
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
       role_id: 4,
-      email: email
+      emails: [{ email }]
     }, authHeaders);
 
-    // ✅ Safely extract the new user ID
     console.log("🔍 Full create response:", createResponse.data);
 
     const newUserId = createResponse.data?.data?.id || createResponse.data?.id;
