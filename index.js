@@ -59,9 +59,14 @@ async function findOrCreateUser(email, name, authHeaders) {
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
       primary_email: email,
+      emails: [
+        {
+          email: email,
+          type: "primary"
+        }
+      ],
       role_id: 4,
-      team_id: 3,
-      emails: [email] // ✅ this ensures the email is saved in the profile
+      team_id: 3
     }, authHeaders);
 
     // ✅ Safely extract the new user ID
