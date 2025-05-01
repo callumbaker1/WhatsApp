@@ -102,7 +102,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
     const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
       subject: `New WhatsApp message from ${from}`,
       requester_id,
-      team_ids: [1], // Replace with your actual support team ID
+      team_ids: [3], // Replace with your actual support team ID
       contents: [
         {
           type: "text",
