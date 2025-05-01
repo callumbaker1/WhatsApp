@@ -138,7 +138,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       ]
     }, authHeaders);
 
-    console.log(JSON.stringify(ticketPayload, null, 2));
+    console.log("📦 Payload to Kayako:\n", JSON.stringify(ticketPayload, null, 2)); // ← log payload
 
     console.log("✅ Ticket successfully created:", ticketResponse.data);
     res.send('<Response></Response>');
