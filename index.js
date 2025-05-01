@@ -102,7 +102,8 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   const { csrf_token, session_id } = session;
 
-  const email = `${from.replace(/\D/g, '')}@whatsapp.stickershop.co.uk`;
+  const phoneNumber = from.replace(/^whatsapp:/, '').replace(/^\+/, '');
+  const email = `${phoneNumber}@whatsapp.stickershop.co.uk`;
 
   console.log("📧 Lookup email:", email);
 
