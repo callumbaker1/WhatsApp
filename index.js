@@ -45,10 +45,10 @@ console.log("🍪 Session ID:", session_id);
 }
 
 async function findOrCreateUser(email, name, authHeaders) {
-  const email = "callumbakes@icloud.com";
+  const email1 = "callumbakes@icloud.com";
   try {
-    console.log("🔍 Searching for user with email:", email);
-    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/search.json?query=${email}&resources=users`, authHeaders);
+    console.log("🔍 Searching for user with email:", email1);
+    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/search.json?query=${email1}&resources=users`, authHeaders);
 
     const users = searchResponse.data?.data || [];
 
