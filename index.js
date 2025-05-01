@@ -26,6 +26,9 @@ async function getSessionAuth() {
     const csrf_token = response.headers['x-csrf-token'];
     const session_id = response.data.session_id;
 
+    console.log("🛡 CSRF Token:", csrf_token);
+console.log("🍪 Session ID:", session_id);
+
     if (!csrf_token || !session_id) {
       console.error('❌ Missing CSRF token or session_id');
       return null;
@@ -78,6 +81,9 @@ app.post('/incoming-whatsapp', async (req, res) => {
   const { csrf_token, session_id } = session;
 
   const email = `${from.replace(/\D/g, '')}@whatsapp.stickershop.co.uk`;
+
+  console.log("📧 Lookup email:", email);
+
   const name = from;
 
   const authHeaders = {
@@ -95,8 +101,11 @@ app.post('/incoming-whatsapp', async (req, res) => {
   const requester_id = await findOrCreateUser(email, name, authHeaders);
 
   if (!requester_id) {
+    console.error('❌ No requester_id returned — user lookup or creation failed');
     return res.status(500).send("User lookup/creation failed");
   }
+  
+  console.log("✅ Requester ID found or created:", requester_id);
 
   try {
     const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
