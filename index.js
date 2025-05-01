@@ -49,9 +49,16 @@ async function findOrCreateUser(email, name, authHeaders) {
     console.log("🔍 Searching for user with email:", email);
     const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${email}&resources=users`, authHeaders);
 
-    if (searchResponse.data && searchResponse.data.length > 0) {
-      console.log("✅ User found:", searchResponse.data[0].id);
-      return searchResponse.data[0].id;
+    const users = searchResponse.data?.data || [];
+
+    if (users.length > 0) {
+      const matchedUser = users.find(u =>
+        (u.emails || []).some(e => e.email === email)
+      );
+      if (matchedUser) {
+        console.log("✅ Exact user match found:", matchedUser.id);
+        return matchedUser.id;
+      }
     }
 
     console.log("👤 User not found, creating new one...");
