@@ -47,7 +47,7 @@ console.log("🍪 Session ID:", session_id);
 async function findOrCreateUser(email, name, authHeaders) {
   try {
     console.log("🔍 Searching for user with email:", email);
-    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/search.json?q=${encodeURIComponent(email)}&resources=users`, authHeaders);
+    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${email}&resources=users`, authHeaders);
 
     if (searchResponse.data && searchResponse.data.length > 0) {
       console.log("✅ User found:", searchResponse.data[0].id);
@@ -59,12 +59,7 @@ async function findOrCreateUser(email, name, authHeaders) {
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
       role_id: 4,
-      team_id: 3,
-      emails: [
-        {
-          email: email
-        }
-      ]
+      email: email
     }, authHeaders);
 
     // ✅ Safely extract the new user ID
