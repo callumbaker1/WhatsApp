@@ -129,12 +129,12 @@ app.post('/incoming-whatsapp', async (req, res) => {
       subject: `New WhatsApp message from ${from}`,
       requester_id,
       team_id: 3,
+      type: "question", // ✅ this is the magic fix
       contents: [
         {
-          channel: "email",      // required
-          type: "text",               // required
-          body: message,              // required
-          via: "user"                 // ✅ this is the missing key
+          type: "text",
+          body: message,
+          via: "user"
         }
       ]
     };
