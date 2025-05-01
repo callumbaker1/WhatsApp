@@ -47,7 +47,7 @@ console.log("🍪 Session ID:", session_id);
 async function findOrCreateUser(email, name, authHeaders) {
   try {
     console.log("🔍 Searching for user with email:", email);
-    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}&resources=users`, authHeaders);
+    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${email}&resources=users`, authHeaders);
 
     if (searchResponse.data && searchResponse.data.length > 0) {
       console.log("✅ User found:", searchResponse.data[0].id);
