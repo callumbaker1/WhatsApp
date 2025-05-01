@@ -48,7 +48,7 @@ async function findOrCreateUser(email, name, authHeaders) {
   try {
     console.log("🔍 Searching for user with email:", email);
     const searchResponse = await axios.get(`${KAYAKO_API_BASE}/users.json?query=${encodeURIComponent(email)}`, authHeaders);
-    
+
     if (searchResponse.data && searchResponse.data.length > 0) {
       console.log("✅ User found:", searchResponse.data[0].id);
       return searchResponse.data[0].id;
@@ -61,11 +61,21 @@ async function findOrCreateUser(email, name, authHeaders) {
       primary_email: email,
       role_id: 4,
       team_id: 3,
-      emails: [email] // ✅ This actually adds the email to the user profile
+      emails: [email] // ✅ this ensures the email is saved in the profile
     }, authHeaders);
 
-    console.log("✅ User created:", createResponse.data?.id || '[no ID returned]');
-    return createResponse.data.id;
+    // ✅ Safely extract the new user ID
+    console.log("🔍 Full create response:", createResponse.data);
+
+    const newUserId = createResponse.data?.data?.id || createResponse.data?.id;
+
+    if (!newUserId) {
+      console.error("❌ User created but no ID returned.");
+      return null;
+    }
+
+    console.log("✅ User created:", newUserId);
+    return newUserId;
 
   } catch (error) {
     console.error("❌ User search/create error:", error.response?.data || error.message);
