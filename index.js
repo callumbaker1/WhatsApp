@@ -131,7 +131,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       team_id: 3,
       contents: [
         {
-          channel: "helpcenter",      // required
+          channel: "email",      // required
           type: "text",               // required
           body: message,              // required
           via: "user"                 // ✅ this is the missing key
