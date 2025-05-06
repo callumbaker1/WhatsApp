@@ -56,7 +56,7 @@ async function findOrCreateUser(email, name, authHeaders) {
 
     if (users.length > 0) {
       const matchedUser = users.find(u =>
-        (u.emails || []).some(e => e.email1 === email1)
+        (u.emails || []).some(e => e.email === email1)
       );
       if (matchedUser) {
         console.log("✅ Exact user match found:", matchedUser.id);
