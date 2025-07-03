@@ -105,9 +105,6 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   const phoneNumber = from.replace(/^whatsapp:/, '').replace(/^\+/, '');
   const email = `${phoneNumber}@whatsapp.stickershop.co.uk`;
-
-  console.log("📧 Lookup email:", email);
-
   const name = from;
 
   const authHeaders = {
@@ -123,35 +120,40 @@ app.post('/incoming-whatsapp', async (req, res) => {
   };
 
   const requester_id = await findOrCreateUser(email, name, authHeaders);
-
   if (!requester_id) {
     console.error('❌ No requester_id returned — user lookup or creation failed');
     return res.status(500).send("User lookup/creation failed");
   }
-  
+
   console.log("✅ Requester ID found or created:", requester_id);
 
   try {
-    const ticketPayload = {
-      subject: `New WhatsApp message from ${from}`,
+    // STEP 1: Create the case
+    const casePayload = {
+      subject: `WhatsApp: ${from}`,
       requester_id,
-      channel: "chat", // 👈 this seems to be accepted for messaging-style input
-      contents: [
-        {
-          body: message
-        }
-      ]
+      source_channel: "MESSENGER" // valid channel
     };
-    
-    console.log("📦 Payload to Kayako:\n", JSON.stringify(ticketPayload, null, 2)); // ← log payload
-    
-    const ticketResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, ticketPayload, authHeaders);
 
-    console.log("✅ Ticket successfully created:", ticketResponse.data);
+    const caseResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, casePayload, authHeaders);
+    const caseId = caseResponse.data?.data?.id;
+
+    console.log("📁 Case created with ID:", caseId);
+
+    // STEP 2: Add a message to the case
+    const convoPayload = {
+      contents: message,
+      source_channel: "MESSENGER"
+    };
+
+    const convoResponse = await axios.post(`${KAYAKO_API_BASE}/cases/${caseId}/conversations.json`, convoPayload, authHeaders);
+
+    console.log("💬 Message added to case:", convoResponse.data);
+
     res.send('<Response></Response>');
   } catch (error) {
-    console.error("❌ Ticket creation failed:", error.response?.data || error.message);
-    res.status(500).send("Ticket creation failed");
+    console.error("❌ Ticket or conversation creation failed:", error.response?.data || error.message);
+    res.status(500).send("Ticket or conversation creation failed");
   }
 });
 
