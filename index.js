@@ -56,12 +56,13 @@ async function findOrCreateUser(email, name, authHeaders) {
 
     if (users.length > 0) {
       const matchedUser = users.find(u =>
-        u.email === email1 ||
-        (u.emails || []).some(e => e.email === email1)
+        u.emails && u.emails.some(e => e.email === email1)
       );
       if (matchedUser) {
         console.log("✅ Exact user match found:", matchedUser.id);
         return matchedUser.id;
+      } else {
+        console.warn("⚠️ User(s) found, but no email match — double-check data:", users);
       }
     }
 
