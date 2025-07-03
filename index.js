@@ -128,20 +128,32 @@ app.post('/incoming-whatsapp', async (req, res) => {
   console.log("✅ Requester ID found or created:", requester_id);
 
   try {
-    const notePayload = {
-      status: 1, // Open
+    // STEP 1: Create the case
+    const casePayload = {
       subject: `WhatsApp: ${from}`,
-      requester_id: requester_id,
+      requester_id,
+      source_channel: "MESSENGER"
+    };
+  
+    const caseResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, casePayload, authHeaders);
+    const caseId = caseResponse.data?.data?.id;
+  
+    console.log("📁 Case created with ID:", caseId);
+  
+    // STEP 2: Add a note to the case
+    const notePayload = {
       contents: [
         {
-          type: "note",
-          body: message
+          body: message,
+          type: "text"
         }
-      ]
+      ],
+      scope: "public"
     };
-
-    const noteResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, notePayload, authHeaders);
-    console.log("📝 Case created with note:", noteResponse.data);
+  
+    const noteResponse = await axios.post(`${KAYAKO_API_BASE}/cases/${caseId}/notes.json`, notePayload, authHeaders);
+  
+    console.log("📝 Note added to case:", noteResponse.data);
     res.send('<Response></Response>');
   } catch (error) {
     console.error("❌ Ticket creation via note failed:", error.response?.data || error.message);
