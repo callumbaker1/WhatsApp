@@ -45,25 +45,25 @@ console.log("🍪 Session ID:", session_id);
 }
 
 async function findOrCreateUser(email, name, authHeaders) {
-  const email1 = email;
   try {
-    console.log("🔍 Searching for user with email:", email1);
-    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/search.json?query=${email1}&resources=users`, authHeaders);
-
-    console.log(searchResponse);
+    console.log("🔍 Searching for user with email:", email);
+    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/search.json?query=${email}&resources=users`, authHeaders);
 
     const users = searchResponse.data?.data || [];
 
     if (users.length > 0) {
       const matchedUser = users.find(u =>
-        u.emails && u.emails.some(e => e.email === email1)
+        u.resource === 'user' && u.snippet === email
       );
+
       if (matchedUser) {
-        console.log("✅ Exact user match found:", matchedUser.id);
-        return matchedUser.id;
-      } else {
-        console.warn("⚠️ User(s) found, but no email match — double-check data:", users);
+        const userId = matchedUser.id;
+        console.log("✅ Exact user match found:", userId);
+        return userId;
       }
+
+      console.warn("⚠️ User(s) found, but no exact snippet match — using first user ID:", users[0].id);
+      return users[0].id; // Fallback to first found
     }
 
     console.log("👤 User not found, creating new one...");
@@ -71,14 +71,10 @@ async function findOrCreateUser(email, name, authHeaders) {
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
       role_id: 4,
-      email: email1
+      email
     }, authHeaders);
 
-    // ✅ Safely extract the new user ID
-    console.log("🔍 Full create response:", createResponse.data);
-
     const newUserId = createResponse.data?.data?.id || createResponse.data?.id;
-
     if (!newUserId) {
       console.error("❌ User created but no ID returned.");
       return null;
