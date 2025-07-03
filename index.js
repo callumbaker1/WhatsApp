@@ -135,14 +135,10 @@ app.post('/incoming-whatsapp', async (req, res) => {
     const ticketPayload = {
       subject: `New WhatsApp message from ${from}`,
       requester_id,
-      team_id: 3,
-      type: "question",
-      channel: "email", // ✅ THIS is what was still missing
       contents: [
         {
           type: "text",
-          body: message,
-          via: "user"
+          body: message
         }
       ]
     };
