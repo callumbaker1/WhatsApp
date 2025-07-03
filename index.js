@@ -27,7 +27,7 @@ async function getSessionAuth() {
     const session_id = response.data.session_id;
 
     console.log("🛡 CSRF Token:", csrf_token);
-console.log("🍪 Session ID:", session_id);
+    console.log("🍪 Session ID:", session_id);
 
     if (!csrf_token || !session_id) {
       console.error('❌ Missing CSRF token or session_id');
@@ -63,7 +63,7 @@ async function findOrCreateUser(email, name, authHeaders) {
       }
 
       console.warn("⚠️ User(s) found, but no exact snippet match — using first user ID:", users[0].id);
-      return users[0].id; // Fallback to first found
+      return users[0].id;
     }
 
     console.log("👤 User not found, creating new one...");
@@ -128,32 +128,24 @@ app.post('/incoming-whatsapp', async (req, res) => {
   console.log("✅ Requester ID found or created:", requester_id);
 
   try {
-    // STEP 1: Create the case
-    const casePayload = {
+    const notePayload = {
+      status: 1, // Open
       subject: `WhatsApp: ${from}`,
-      requester_id,
-      source_channel: "MESSENGER" // valid channel
+      requester_id: requester_id,
+      contents: [
+        {
+          type: "note",
+          body: message
+        }
+      ]
     };
 
-    const caseResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, casePayload, authHeaders);
-    const caseId = caseResponse.data?.data?.id;
-
-    console.log("📁 Case created with ID:", caseId);
-
-    // STEP 2: Add a message to the case
-    const convoPayload = {
-      contents: message,
-      source_channel: "MESSENGER"
-    };
-
-    const convoResponse = await axios.post(`${KAYAKO_API_BASE}/cases/${caseId}/conversations.json`, convoPayload, authHeaders);
-
-    console.log("💬 Message added to case:", convoResponse.data);
-
+    const noteResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, notePayload, authHeaders);
+    console.log("📝 Case created with note:", noteResponse.data);
     res.send('<Response></Response>');
   } catch (error) {
-    console.error("❌ Ticket or conversation creation failed:", error.response?.data || error.message);
-    res.status(500).send("Ticket or conversation creation failed");
+    console.error("❌ Ticket creation via note failed:", error.response?.data || error.message);
+    res.status(500).send("Ticket creation failed");
   }
 });
 
