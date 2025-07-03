@@ -135,9 +135,9 @@ app.post('/incoming-whatsapp', async (req, res) => {
     const ticketPayload = {
       subject: `New WhatsApp message from ${from}`,
       requester_id,
+      channel: "chat", // 👈 this seems to be accepted for messaging-style input
       contents: [
         {
-          type: "text",
           body: message
         }
       ]
