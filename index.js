@@ -34,10 +34,7 @@ async function getSessionAuth() {
       return null;
     }
 
-    return {
-      csrf_token,
-      session_id
-    };
+    return { csrf_token, session_id };
   } catch (error) {
     console.error("❌ Auth error:", error.message);
     return null;
@@ -47,27 +44,21 @@ async function getSessionAuth() {
 async function findOrCreateUser(email, name, authHeaders) {
   try {
     console.log("🔍 Searching for user with email:", email);
-    const searchResponse = await axios.get(`${KAYAKO_API_BASE}/search.json?query=${email}&resources=users`, authHeaders);
+    const searchResponse = await axios.get(
+      `${KAYAKO_API_BASE}/search.json?query=${email}&resources=users`,
+      authHeaders
+    );
 
     const users = searchResponse.data?.data || [];
 
     if (users.length > 0) {
-      const matchedUser = users.find(u =>
-        u.resource === 'user' && u.snippet === email
-      );
-
-      if (matchedUser) {
-        const userId = matchedUser.id;
-        console.log("✅ Exact user match found:", userId);
-        return userId;
-      }
-
-      console.warn("⚠️ User(s) found, but no exact snippet match — using first user ID:", users[0].id);
-      return users[0].id;
+      const matchedUser = users.find(u => u.resource === 'user' && u.snippet === email);
+      const userId = matchedUser ? matchedUser.id : users[0].id;
+      console.log("✅ Exact user match found:", userId);
+      return userId;
     }
 
     console.log("👤 User not found, creating new one...");
-
     const createResponse = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
       full_name: name,
       role_id: 4,
@@ -75,14 +66,8 @@ async function findOrCreateUser(email, name, authHeaders) {
     }, authHeaders);
 
     const newUserId = createResponse.data?.data?.id || createResponse.data?.id;
-    if (!newUserId) {
-      console.error("❌ User created but no ID returned.");
-      return null;
-    }
-
     console.log("✅ User created:", newUserId);
     return newUserId;
-
   } catch (error) {
     console.error("❌ User search/create error:", error.response?.data || error.message);
     return null;
@@ -97,12 +82,10 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   const session = await getSessionAuth();
   if (!session) {
-    console.error('❌ Ticket creation failed: Authentication failed');
     return res.status(500).send("Auth failed");
   }
 
   const { csrf_token, session_id } = session;
-
   const phoneNumber = from.replace(/^whatsapp:/, '').replace(/^\+/, '');
   const email = `${phoneNumber}@whatsapp.stickershop.co.uk`;
   const name = from;
@@ -121,43 +104,27 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   const requester_id = await findOrCreateUser(email, name, authHeaders);
   if (!requester_id) {
-    console.error('❌ No requester_id returned — user lookup or creation failed');
     return res.status(500).send("User lookup/creation failed");
   }
 
   console.log("✅ Requester ID found or created:", requester_id);
 
   try {
-    // STEP 1: Create the case
-    const casePayload = {
-      subject: `WhatsApp: ${from}`,
-      requester_id,
-      source_channel: "MESSENGER"
-    };
-  
-    const caseResponse = await axios.post(`${KAYAKO_API_BASE}/cases.json`, casePayload, authHeaders);
-    const caseId = caseResponse.data?.data?.id;
-  
-    console.log("📁 Case created with ID:", caseId);
-  
-    // STEP 2: Add a note to the case
     const notePayload = {
-      contents: [
-        {
-          body: message,
-          type: "text"
-        }
-      ],
-      scope: "public"
+      subject: `WhatsApp from ${from}`,
+      requester_id,
+      contents: message,
+      type: "note",
+      status: "open"
     };
-  
-    const noteResponse = await axios.post(`${KAYAKO_API_BASE}/cases/${caseId}/notes.json`, notePayload, authHeaders);
-  
-    console.log("📝 Note added to case:", noteResponse.data);
+
+    const response = await axios.post(`${KAYAKO_API_BASE}/notes.json`, notePayload, authHeaders);
+    console.log("📝 Case created via note:", response.data);
+
     res.send('<Response></Response>');
   } catch (error) {
     console.error("❌ Ticket creation via note failed:", error.response?.data || error.message);
-    res.status(500).send("Ticket creation failed");
+    res.status(500).send("Note creation failed");
   }
 });
 
