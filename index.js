@@ -113,8 +113,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
     const casePayload = {
       subject: `WhatsApp from ${from}`,
       requester_id,
-      type: "note",
-      status: "open",
+      channel: "email", // use a valid channel
       contents: [
         {
           type: "text",
@@ -122,14 +121,14 @@ app.post('/incoming-whatsapp', async (req, res) => {
         }
       ]
     };
-    
+  
     const response = await axios.post(`${KAYAKO_API_BASE}/cases.json`, casePayload, authHeaders);
-    console.log("📝 Case created via note:", response.data);
-
+    console.log("📁 Case created successfully:", response.data);
+  
     res.send('<Response></Response>');
   } catch (error) {
-    console.error("❌ Ticket creation via note failed:", error.response?.data || error.message);
-    res.status(500).send("Note creation failed");
+    console.error("❌ Ticket creation failed:", error.response?.data || error.message);
+    res.status(500).send("Ticket creation failed");
   }
 });
 
