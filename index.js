@@ -109,20 +109,21 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   console.log("✅ Requester ID found or created:", requester_id);
 
-  const casePayload = {
-    subject: `WhatsApp from ${from}`,
-    requester_id,
-    type: "note",
-    status: "open",
-    contents: [
-      {
-        type: "text",
-        body: message
-      }
-    ]
-  };
-  
-  const response = await axios.post(`${KAYAKO_API_BASE}/cases.json`, casePayload, authHeaders);
+  try {
+    const casePayload = {
+      subject: `WhatsApp from ${from}`,
+      requester_id,
+      type: "note",
+      status: "open",
+      contents: [
+        {
+          type: "text",
+          body: message
+        }
+      ]
+    };
+    
+    const response = await axios.post(`${KAYAKO_API_BASE}/cases.json`, casePayload, authHeaders);
     console.log("📝 Case created via note:", response.data);
 
     res.send('<Response></Response>');
