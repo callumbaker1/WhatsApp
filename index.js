@@ -1,200 +1,212 @@
-// index.js – WhatsApp → Kayako bridge (public replies via MAIL channel)
+// WhatsApp -> Kayako webhook
+// - One active case per WhatsApp user
+// - Append messages as the REQUESTER (not agent)
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
-const dotenv = require('dotenv');
-dotenv.config();
+require('dotenv').config();
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
-const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/v1`;
+const API = `${KAYAKO_BASE_URL}/api/v1`;
 
-// ---------- Session / Auth ----------
+// ---------- helpers ----------
+function authHeaders(csrf, sessionId) {
+  return {
+    headers: {
+      'X-CSRF-Token': csrf,
+      'Cookie': `kayako_session_id=${sessionId}`,
+      'Content-Type': 'application/json'
+    },
+    auth: {
+      username: process.env.KAYAKO_USERNAME,
+      password: process.env.KAYAKO_PASSWORD
+    }
+  };
+}
+
 async function getSessionAuth() {
   try {
-    const resp = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
+    // any authed GET gives us CSRF + session
+    const r = await axios.get(`${API}/cases.json`, {
       auth: {
         username: process.env.KAYAKO_USERNAME,
         password: process.env.KAYAKO_PASSWORD
       },
       headers: { 'Content-Type': 'application/json' }
     });
-
-    const csrf = resp.headers['x-csrf-token'];
-    const session_id = resp.data?.session_id;
+    const csrf = r.headers['x-csrf-token'];
+    const sessionId = r.data?.session_id;
     console.log('🛡 CSRF Token:', csrf);
-    console.log('🍪 Session ID:', session_id);
-
-    if (!csrf || !session_id) return null;
-    return { csrf, session_id };
+    console.log('🍪 Session ID:', sessionId);
+    if (!csrf || !sessionId) return null;
+    return { csrf, sessionId };
   } catch (e) {
     console.error('❌ Auth error:', e.response?.data || e.message);
     return null;
   }
 }
 
-function kayakoClient({ csrf, session_id }) {
-  return axios.create({
-    baseURL: KAYAKO_API_BASE,
-    auth: {
-      username: process.env.KAYAKO_USERNAME,
-      password: process.env.KAYAKO_PASSWORD
-    },
-    headers: {
-      'X-CSRF-Token': csrf,
-      'Cookie': `kayako_session_id=${session_id}`,
-      'Content-Type': 'application/json'
-    },
-    timeout: 15000
-  });
-}
-
-// ---------- Users ----------
-async function findOrCreateUser(client, email, name) {
+async function findOrCreateUser(email, fullName, ah) {
   try {
     console.log('🔍 Searching for user with email:', email);
-    const sr = await client.get(`/search.json`, { params: { query: email, resources: 'users' } });
-    const hits = sr.data?.data || [];
-    const matched = hits.find(u => u.resource === 'user' && (u.snippet === email || u.email === email));
-    if (matched) {
-      console.log('✅ Exact user match found:', matched.id);
-      return matched.id;
+    const s = await axios.get(`${API}/search.json?query=${encodeURIComponent(email)}&resources=users`, ah);
+    const hits = s.data?.data || [];
+    if (hits.length) {
+      const exact = hits.find(u => u.resource === 'user' && u.snippet === email);
+      const id = exact ? exact.id : hits[0].id;
+      console.log('✅ Exact user match found:', id);
+      return id;
+    }
+    console.log('👤 User not found, creating...');
+    const c = await axios.post(`${API}/users.json`, {
+      full_name: fullName,
+      role_id: 4, // customer
+      email
+    }, ah);
+    const id = c.data?.data?.id || c.data?.id;
+    console.log('✅ User created:', id);
+    return id;
+  } catch (e) {
+    console.error('❌ User error:', e.response?.data || e.message);
+    return null;
+  }
+}
+
+// Get the user's email identity id (needed so the message is “from” them)
+async function getEmailIdentityId(userId, email, ah) {
+  try {
+    const r = await axios.get(`${API}/users/${userId}/identities.json`, ah);
+    const identities = r.data?.data || [];
+    const emailId = identities.find(i =>
+      (i.resource_type === 'identity_email' || i.type === 'email') &&
+      (i.email?.toLowerCase?.() === email.toLowerCase())
+    )?.id;
+
+    if (emailId) {
+      return emailId;
     }
 
-    console.log('👤 User not found, creating…');
-    const cr = await client.post(`/users.json`, {
-      full_name: name,
-      role_id: 4,
+    // Fallback: create an email identity for this address
+    const c = await axios.post(`${API}/users/${userId}/identities.json`, {
+      type: 'email',
       email
-    });
-    const uid = cr.data?.data?.id || cr.data?.id;
-    console.log('✅ User created:', uid);
-    return uid;
+    }, ah);
+    return c.data?.data?.id || c.data?.id;
   } catch (e) {
-    console.error('❌ User lookup/create failed:', e.response?.data || e.message);
+    console.error('❌ identity error:', e.response?.data || e.message);
     return null;
   }
 }
 
-// ---------- Channel helpers ----------
-async function getMailChannelForNewCase(client, requester_id) {
+// Find the most recent ACTIVE/OPEN case for requester
+async function findActiveCaseId(requesterId, ah) {
   try {
-    const r = await client.get(`/cases/channels.json`, { params: { user_id: requester_id } });
-    const chans = r.data?.data || [];
-    const mail = chans.find(c => c.type === 'MAIL');
-    if (mail) return { channel: 'MAIL', channel_id: mail.account?.id };
+    // Filter by requester + ACTIVE state, newest first, limit 1
+    const url = `${API}/cases.json?requester_id=${encodeURIComponent(requesterId)}&state=ACTIVE&sort=updated_at:desc&limit=1`;
+    const r = await axios.get(url, ah);
+    const latest = r.data?.data?.[0];
+    if (latest) {
+      console.log('🔎 Reusing latest ACTIVE case via /cases:', latest.id);
+      return latest.id;
+    }
+    return null;
   } catch (e) {
-    console.warn('⚠️ Could not retrieve new-case channels:', e.response?.data || e.message);
-  }
-  return { channel: 'NOTE', channel_id: null }; // safe fallback
-}
-
-async function getMailChannelForReply(client, caseId) {
-  try {
-    const r = await client.get(`/cases/${caseId}/reply/channels.json`);
-    const chans = r.data?.data || [];
-    const mail = chans.find(c => c.type === 'MAIL');
-    if (mail) return { channel: 'MAIL', channel_id: mail.account?.id };
-  } catch (e) {
-    console.warn('⚠️ Could not retrieve reply channels:', e.response?.data || e.message);
-  }
-  return { channel: 'NOTE', channel_id: null }; // safe fallback
-}
-
-// ---------- Case helpers ----------
-async function findLatestActiveCaseId(client, requester_id) {
-  try {
-    const r = await client.get(`/cases.json`, {
-      params: {
-        requester_id,
-        state: 'ACTIVE',
-        sort: 'created_at',
-        order: 'desc',
-        limit: 1
-      }
-    });
-    const id = r.data?.data?.[0]?.id;
-    if (id) console.log('🔎 Reusing latest ACTIVE case via /cases:', id);
-    return id || null;
-  } catch (e) {
-    console.warn('⚠️ Could not list cases:', e.response?.data || e.message);
+    console.error('❌ findActiveCase error:', e.response?.data || e.message);
     return null;
   }
 }
 
-async function createNewMailCase(client, requester_id, from, message) {
-  const { channel, channel_id } = await getMailChannelForNewCase(client, requester_id);
+async function createNewCase(subject, requesterId, message, ah) {
   const payload = {
-    subject: `WhatsApp: ${from.replace('whatsapp:', '')}`,
-    requester_id,
-    channel,                 // prefer MAIL so it’s public
-    ...(channel_id ? { channel_id } : {}),
-    contents: message        // Kayako expects a string here
+    subject,
+    requester_id: requesterId,
+    channel: 'mail',               // valid channel key
+    contents: [{ type: 'text', body: message }]
   };
-  const resp = await client.post(`/cases.json`, payload);
-  // creation returns a job (202) in docs, but many installs return the case directly (201)
-  const caseId = resp.data?.data?.id || resp.data?.id;
-  return { id: caseId, raw: resp.data };
+  const r = await axios.post(`${API}/cases.json`, payload, ah);
+  console.log('📁 Case created:', r.data?.data?.id || r.data?.id);
+  return r.data?.data?.id || r.data?.id;
 }
 
-async function replyToCase(client, caseId, message) {
-  const { channel, channel_id } = await getMailChannelForReply(client, caseId);
+// Append a PUBLIC message as the REQUESTER (not the agent)
+async function appendMessageAsRequester(caseId, requesterId, identityId, text, ah) {
   const payload = {
-    contents: message,       // must be a plain string per docs
-    channel,                 // MAIL => public, NOTE => private
-    ...(channel_id ? { channel_id } : {})
+    case:      { id: caseId, resource_type: 'case' },
+    actor:     { id: requesterId, resource_type: 'user' },     // who is speaking
+    identity:  { id: identityId,  resource_type: 'identity_email' }, // “via” which email
+    channel:   'mail',                                        // show as email-style message
+    origin:    'USER',                                        // from the requester
+    is_public: true,
+    contents:  [{ type: 'text', body: text }]
   };
-  return client.post(`/cases/${caseId}/reply.json`, payload);
+
+  // POST to messages
+  const r = await axios.post(`${API}/messages.json`, payload, ah);
+  console.log('✉️ Public reply appended to case:', caseId);
+  return r.data;
 }
 
-// ---------- Webhook ----------
+// ---------- webhook ----------
 app.post('/incoming-whatsapp', async (req, res) => {
-  const from = req.body.From;   // e.g. "whatsapp:+44..."
+  const from = req.body.From;         // e.g. 'whatsapp:+4479...'
   const body = req.body.Body || '';
   console.log(`📩 WhatsApp from ${from}: ${body}`);
 
-  // Session + client
-  const session = await getSessionAuth();
-  if (!session) return res.status(500).send('Auth failed');
-  const client = kayakoClient(session);
+  const auth = await getSessionAuth();
+  if (!auth) return res.status(500).send('Auth failed');
 
-  // WhatsApp identity → pseudo email + display name
-  const phone = String(from || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
+  const { csrf, sessionId } = auth;
+  const ah = authHeaders(csrf, sessionId);
+
+  // Create a unique email for this WhatsApp number
+  const phone = String(from).replace(/^whatsapp:/, '').replace(/^\+/, '');
   const email = `${phone}@whatsapp.stickershop.co.uk`;
-  const name  = from;
+  const displayName = `WhatsApp: ${phone}`;
 
-  // User
-  const requester_id = await findOrCreateUser(client, email, name);
-  if (!requester_id) return res.status(500).send('User lookup/creation failed');
-  console.log('✅ Requester ID:', requester_id);
+  // Ensure requester exists
+  const requesterId = await findOrCreateUser(email, displayName, ah);
+  if (!requesterId) return res.status(500).send('User error');
+  console.log('✅ Requester ID:', requesterId);
 
-  // Case: reuse or create
-  let caseId = await findLatestActiveCaseId(client, requester_id);
+  // Ensure we have an email identity for this address
+  const identityId = await getEmailIdentityId(requesterId, email, ah);
 
-  try {
-    if (caseId) {
-      console.log('♻️ Appending to existing case:', caseId);
-      await replyToCase(client, caseId, body);
-      console.log('✉️ Public reply appended to case:', caseId);
-    } else {
-      console.log('🆕 No active case; creating a new one (MAIL)…');
-      const created = await createNewMailCase(client, requester_id, from, body);
-      console.log('📁 Case created:', created.raw);
-      caseId = created.id;
-    }
-
-    // Twilio requires a 200 text/xml-ish response even if empty
-    res.type('text/xml').send('<Response></Response>');
-  } catch (e) {
-    console.error('❌ Failed to create/append message:', e.response?.data || e.message);
-    res.status(500).send('Kayako error');
+  // Find (or create) an active case for this requester
+  let caseId = await findActiveCaseId(requesterId, ah);
+  if (!caseId) {
+    caseId = await createNewCase(displayName, requesterId, body, ah);
+    return res.send('<Response></Response>'); // first message became the case’s first message
   }
+
+  console.log('♻️ Appending to existing case:', caseId);
+
+  // Try to append as REQUESTER
+  try {
+    await appendMessageAsRequester(caseId, requesterId, identityId, body, ah);
+  } catch (e) {
+    console.error('❌ append as requester failed:', e.response?.data || e.message);
+    // Last-resort fallback: add a public note so nothing is lost
+    try {
+      await axios.post(`${API}/cases/${caseId}/notes.json`, {
+        is_public: true,
+        contents: [{ type: 'text', body }]
+      }, ah);
+      console.log('🗒️ Fallback: public note added');
+    } catch (e2) {
+      console.error('❌ Fallback note failed:', e2.response?.data || e2.message);
+      return res.status(500).send('Append failed');
+    }
+  }
+
+  res.send('<Response></Response>');
 });
 
-// Health
+// health
 app.get('/', (_req, res) => res.send('Webhook is running ✅'));
 
 const PORT = process.env.PORT || 3000;
