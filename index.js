@@ -2,7 +2,7 @@
 'use strict';
 
 const express = require('express');
-const bodyParser = require('body-parser'); // Twilio webhooks are x-www-form-urlencoded
+const bodyParser = require('body-parser'); // Twilio sends x-www-form-urlencoded
 const axios = require('axios');
 const dotenv = require('dotenv');
 dotenv.config();
@@ -14,12 +14,12 @@ app.use(bodyParser.json());
 const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
 const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/v1`;
 
-/* ---------------- Auth + helpers ---------------- */
+/* ---------------- Auth + headers ---------------- */
 async function getSessionAuth() {
   try {
     const r = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
       auth: { username: process.env.KAYAKO_USERNAME, password: process.env.KAYAKO_PASSWORD },
-      headers: { 'Content-Type': 'application/json' }
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' }
     });
     const csrf = r.headers['x-csrf-token'];
     const sid  = r.data?.session_id;
@@ -34,13 +34,23 @@ async function getSessionAuth() {
 }
 
 function authHeaders(csrf_token, session_id) {
+  // Add both header AND cookie for CSRF; include Accept + X-Requested-With
+  const cookie = [
+    `kayako_session_id=${session_id}`,
+    `kayako_csrf_token=${csrf_token}`
+  ].join('; ');
   return {
     headers: {
       'X-CSRF-Token': csrf_token,
-      'Cookie': `kayako_session_id=${session_id}`,
-      'Content-Type': 'application/json'
+      'Cookie': cookie,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest'
     },
-    auth: { username: process.env.KAYAKO_USERNAME, password: process.env.KAYAKO_PASSWORD }
+    auth: {
+      username: process.env.KAYAKO_USERNAME,
+      password: process.env.KAYAKO_PASSWORD
+    }
   };
 }
 
@@ -80,7 +90,7 @@ async function findOrCreateUser(email, name, hdrs) {
 
 /* ---------------- Cases ---------------- */
 async function findActiveCaseForRequester(requesterId, email, hdrs) {
-  // Preferred: filter /cases
+  // Preferred: filter /cases by requester + state
   try {
     const r = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
       ...hdrs,
@@ -95,7 +105,7 @@ async function findActiveCaseForRequester(requesterId, email, hdrs) {
     console.warn('↪︎ /cases filter not available:', err.response?.data || err.message);
   }
 
-  // Fallback: search by email -> cases
+  // Fallback: search for cases by email
   try {
     const s = await axios.get(
       `${KAYAKO_API_BASE}/search.json?query=${encodeURIComponent(email)}&resources=cases`,
@@ -116,7 +126,7 @@ async function findActiveCaseForRequester(requesterId, email, hdrs) {
   return null;
 }
 
-/* ---------------- Append message with robust fallbacks ---------------- */
+/* ---------------- Append helpers ---------------- */
 async function tryPost(url, payload, hdrs, label) {
   try {
     const r = await axios.post(url, payload, hdrs);
@@ -127,7 +137,6 @@ async function tryPost(url, payload, hdrs, label) {
     return false;
   }
 }
-
 async function tryPatch(url, payload, hdrs, label) {
   try {
     const r = await axios.patch(url, payload, hdrs);
@@ -139,62 +148,46 @@ async function tryPatch(url, payload, hdrs, label) {
   }
 }
 
+/**
+ * Try several API shapes your instance might accept.
+ * IMPORTANT: no `channel` field; contents use { type:'text', text:'...' }
+ */
 async function appendToCase(caseId, text, hdrs) {
-  // 1) Root posts endpoint
+  const contents = [{ type: 'text', text }];
+
+  // 1) Root posts endpoint (case relationship in payload)
   if (await tryPost(
     `${KAYAKO_API_BASE}/posts.json`,
-    {
-      case: { id: caseId },
-      type: 'message',
-      is_public: true,
-      channel: 'email',
-      contents: [{ type: 'text', body: text }]
-    },
-    hdrs,
-    'POST /posts.json'
+    { case: { id: caseId }, type: 'message', is_public: true, contents },
+    hdrs, 'POST /posts.json'
   )) return true;
 
   // 2) Case-scoped posts
   if (await tryPost(
     `${KAYAKO_API_BASE}/cases/${caseId}/posts.json`,
-    {
-      type: 'message',
-      is_public: true,
-      channel: 'email',
-      contents: [{ type: 'text', body: text }]
-    },
-    hdrs,
-    'POST /cases/{id}/posts.json'
+    { type: 'message', is_public: true, contents },
+    hdrs, 'POST /cases/{id}/posts.json'
   )) return true;
 
-  // 3) PATCH case with contents (some stacks append a post)
+  // 3) PATCH case with contents (some tenants accept this to append a post)
   if (await tryPatch(
     `${KAYAKO_API_BASE}/cases/${caseId}.json`,
-    { contents: [{ type: 'text', body: text, channel: 'email' }] },
-    hdrs,
-    'PATCH /cases/{id}.json'
+    { contents },
+    hdrs, 'PATCH /cases/{id}.json'
   )) return true;
 
-  // 4) Notes – try several payload shapes that different Kayako builds expect
+  // 4) Notes endpoint (private). First with contents array (strict format)
   if (await tryPost(
     `${KAYAKO_API_BASE}/cases/${caseId}/notes.json`,
-    { contents: [{ type: 'text', body: text }] },
-    hdrs,
-    'POST /cases/{id}/notes.json (contents)'
+    { contents }, // NOTE: contents with {type:'text', text:'...'}
+    hdrs, 'POST /cases/{id}/notes.json (contents)'
   )) return true;
 
+  // 5) Notes endpoint variant with { text } only (older builds)
   if (await tryPost(
     `${KAYAKO_API_BASE}/cases/${caseId}/notes.json`,
-    { text }, // some stacks require `text`
-    hdrs,
-    'POST /cases/{id}/notes.json (text)'
-  )) return true;
-
-  if (await tryPost(
-    `${KAYAKO_API_BASE}/cases/${caseId}/notes.json`,
-    { body: text }, // very old builds look for `body`
-    hdrs,
-    'POST /cases/{id}/notes.json (body)'
+    { text },
+    hdrs, 'POST /cases/{id}/notes.json (text)'
   )) return true;
 
   return false;
@@ -208,9 +201,10 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   const session = await getSessionAuth();
   if (!session) return res.status(500).send('Auth failed');
+
   const hdrs = authHeaders(session.csrf_token, session.session_id);
 
-  // map WhatsApp number -> synthetic email
+  // map WhatsApp number -> synthetic email identity
   const phone = from.replace(/^whatsapp:/, '').replace(/^\+/, '');
   const email = `${phone}@whatsapp.stickershop.co.uk`;
   const name  = from;
@@ -221,10 +215,14 @@ app.post('/incoming-whatsapp', async (req, res) => {
   console.log('✅ Requester ID:', requester_id);
 
   try {
-    // Reuse or create a single active case for this requester
+    // Reuse/create single active case for this requester
     let caseId = await findActiveCaseForRequester(requester_id, email, hdrs);
     if (!caseId) {
-      const created = await axios.post(`${KAYAKO_API_BASE}/cases.json`, { subject, requester_id }, hdrs);
+      // Create the case first (no contents here; we’ll append right after)
+      const created = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
+        subject,
+        requester_id
+      }, hdrs);
       caseId = created.data?.data?.id || created.data?.id;
       console.log('📁 New case created:', caseId);
     } else {
