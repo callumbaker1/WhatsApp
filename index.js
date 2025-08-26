@@ -1,15 +1,15 @@
 // index.js
-// WhatsApp ➜ Kayako bridge (single threaded case per requester)
+// WhatsApp ➜ Kayako bridge (single-thread case per requester, public messages)
 //
-// ENV required:
+// ENV:
 //   KAYAKO_USERNAME=youremail@domain
-//   KAYAKO_PASSWORD=yourkayakopassword
-//   PORT=10000 (Render provides PORT automatically)
+//   KAYAKO_PASSWORD=yourpassword
+//   PORT=10000  (Render will inject PORT)
 
 'use strict';
 
 const express = require('express');
-const bodyParser = require('body-parser'); // parse Twilio x-www-form-urlencoded
+const bodyParser = require('body-parser'); // Twilio sends x-www-form-urlencoded
 const axios = require('axios');
 const dotenv = require('dotenv');
 dotenv.config();
@@ -22,7 +22,7 @@ app.use(bodyParser.json());
 const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
 const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/v1`;
 
-// ---------- Auth: get CSRF + session cookie ----------
+// ---------- Auth helpers ----------
 async function getSessionAuth() {
   try {
     const resp = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
@@ -33,25 +33,24 @@ async function getSessionAuth() {
       headers: { 'Content-Type': 'application/json' }
     });
 
-    const csrf = resp.headers['x-csrf-token'];
-    const sessionId = resp.data?.session_id;
+    const csrf_token = resp.headers['x-csrf-token'];
+    const session_id = resp.data?.session_id;
 
-    console.log('🛡 CSRF Token:', csrf);
-    console.log('🍪 Session ID:', sessionId);
+    console.log('🛡 CSRF Token:', csrf_token);
+    console.log('🍪 Session ID:', session_id);
 
-    if (!csrf || !sessionId) {
-      console.error('❌ Missing CSRF token or session_id from Kayako auth response');
+    if (!csrf_token || !session_id) {
+      console.error('❌ Missing CSRF token or session_id');
       return null;
     }
-    return { csrf_token: csrf, session_id: sessionId };
+    return { csrf_token, session_id };
   } catch (err) {
     console.error('❌ Auth error:', err.response?.data || err.message);
     return null;
   }
 }
 
-// Build the standard auth headers for subsequent Kayako calls
-function buildAuthHeaders(csrf_token, session_id) {
+function authHeaders(csrf_token, session_id) {
   return {
     headers: {
       'X-CSRF-Token': csrf_token,
@@ -65,33 +64,26 @@ function buildAuthHeaders(csrf_token, session_id) {
   };
 }
 
-// ---------- Users: find or create by email ----------
-async function findOrCreateUser(email, name, authHeaders) {
+// ---------- Users ----------
+async function findOrCreateUser(email, name, hdrs) {
   try {
     console.log('🔍 Searching for user with email:', email);
-
-    // Search API for users
     const s = await axios.get(
       `${KAYAKO_API_BASE}/search.json?query=${encodeURIComponent(email)}&resources=users`,
-      authHeaders
+      hdrs
     );
     const hits = s.data?.data || [];
-
     if (hits.length) {
-      // Prefer an exact match if present
       const exact = hits.find(u => u.resource === 'user' && (u.snippet === email || u.email === email));
-      const userId = (exact || hits[0]).id;
-      console.log('✅ Exact user match found:', userId);
-      return userId;
+      const id = (exact || hits[0]).id;
+      console.log('✅ Exact user match found:', id);
+      return id;
     }
 
-    // Create new user
     console.log('👤 User not found, creating…');
     const create = await axios.post(`${KAYAKO_API_BASE}/users.json`, {
-      full_name: name || email,
-      role_id: 4, // customer
-      email
-    }, authHeaders);
+      full_name: name || email, role_id: 4, email
+    }, hdrs);
 
     const newId = create.data?.data?.id || create.data?.id;
     console.log('✅ User created:', newId);
@@ -102,12 +94,12 @@ async function findOrCreateUser(email, name, authHeaders) {
   }
 }
 
-// ---------- Cases: find latest ACTIVE by requester (or via search) ----------
-async function findActiveCaseForRequester(requesterId, email, authHeaders) {
-  // 1) Try filtered /cases.json (some Kayako stacks support this)
+// ---------- Cases ----------
+async function findActiveCaseForRequester(requesterId, email, hdrs) {
+  // Try filtered /cases first
   try {
     const r = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
-      ...authHeaders,
+      ...hdrs,
       params: {
         requester_id: requesterId,
         state: 'ACTIVE',
@@ -117,30 +109,27 @@ async function findActiveCaseForRequester(requesterId, email, authHeaders) {
       }
     });
     const rows = r.data?.data || r.data || [];
-    if (rows.length) {
-      const id = rows[0].id || rows[0].data?.id;
-      if (id) {
-        console.log('🔎 Reusing latest ACTIVE case via /cases:', id);
-        return id;
-      }
+    if (rows.length && rows[0].id) {
+      console.log('🔎 Reusing latest ACTIVE case via /cases:', rows[0].id);
+      return rows[0].id;
     }
   } catch (err) {
     console.warn('↪︎ /cases filter not available; falling back to /search.', err.response?.data || err.message);
   }
 
-  // 2) Fallback: search by email, filter ACTIVE client-side
+  // Fallback: search by email, filter ACTIVE
   try {
     const s = await axios.get(
       `${KAYAKO_API_BASE}/search.json?query=${encodeURIComponent(email)}&resources=cases`,
-      authHeaders
+      hdrs
     );
     const hits = s.data?.data || [];
-    const candidates = hits
+    const active = hits
       .filter(h => (h.state || '').toUpperCase() === 'ACTIVE')
       .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
-    if (candidates.length) {
-      console.log('🔎 Reusing ACTIVE case via /search:', candidates[0].id);
-      return candidates[0].id;
+    if (active.length) {
+      console.log('🔎 Reusing ACTIVE case via /search:', active[0].id);
+      return active[0].id;
     }
   } catch (err) {
     console.warn('↪︎ /search fallback failed:', err.response?.data || err.message);
@@ -149,108 +138,103 @@ async function findActiveCaseForRequester(requesterId, email, authHeaders) {
   return null;
 }
 
-// ---------- Posts/Messages: add a PUBLIC message to a case ----------
-async function addPublicMessage(caseId, bodyText, authHeaders, subject = '') {
-  // Try multiple endpoints—different Kayako versions enable different routes/fields
-  const attempts = [
-    {
-      url: `${KAYAKO_API_BASE}/messages.json`,
-      payload: {
-        case_id: caseId,
-        status: 'SENT',              // public message
-        direction: 'INCOMING',       // from customer
-        subject,
-        contents: [{ type: 'text', body: bodyText }],
-        channel: 'email'
-      }
-    },
-    {
-      url: `${KAYAKO_API_BASE}/posts.json`,
-      payload: {
-        case_id: caseId,
-        type: 'message',             // message (not note)
-        is_public: true,
-        contents: [{ type: 'text', body: bodyText }],
-        channel: 'email'
-      }
-    },
-    {
-      url: `${KAYAKO_API_BASE}/cases/${caseId}/messages.json`,
-      payload: {
-        status: 'SENT',
-        direction: 'INCOMING',
-        subject,
-        contents: [{ type: 'text', body: bodyText }],
-        channel: 'email'
-      }
-    }
-  ];
-
-  for (const a of attempts) {
-    try {
-      const resp = await axios.post(a.url, a.payload, authHeaders);
-      console.log(`✉️ Public message posted via ${a.url}:`, resp.data?.id || resp.data);
-      return true;
-    } catch (err) {
-      console.warn(`↪︎ Message attempt failed @ ${a.url}`, err.response?.data || err.message);
-    }
+// ---------- Append a PUBLIC message (preferred) or fall back ----------
+async function addPublicMessage(caseId, body, hdrs, subject = '') {
+  // 1) Preferred: case-scoped posts endpoint (message)
+  try {
+    const url = `${KAYAKO_API_BASE}/cases/${caseId}/posts.json`;
+    const payload = {
+      type: 'message',                 // public message
+      is_public: true,                 // some stacks need this
+      channel: 'email',                // any valid built-in channel
+      contents: [{ type: 'text', body }]
+    };
+    const r = await axios.post(url, payload, hdrs);
+    console.log('✉️ Public message via /cases/{id}/posts:', r.data?.id || r.data);
+    return true;
+  } catch (err) {
+    console.warn('↪︎ /cases/{id}/posts failed', err.response?.data || err.message);
   }
+
+  // 2) Fallback: PATCH the case with contents (many stacks append as a post)
+  try {
+    const url = `${KAYAKO_API_BASE}/cases/${caseId}.json`;
+    const payload = {
+      contents: [
+        { type: 'text', body, channel: 'email' } // will append a post (public/note depends on stack)
+      ]
+    };
+    const r = await axios.patch(url, payload, hdrs);
+    console.log('✉️ Message appended via PATCH /cases/{id}:', r.data?.id || r.data);
+    return true;
+  } catch (err) {
+    console.warn('↪︎ PATCH /cases/{id} failed', err.response?.data || err.message);
+  }
+
+  // 3) Last resort: create a note so the content is still captured
+  try {
+    const url = `${KAYAKO_API_BASE}/cases/${caseId}/notes.json`;
+    const payload = { contents: [{ type: 'text', body }] };
+    const r = await axios.post(url, payload, hdrs);
+    console.log('🗒️ Fallback note created via /cases/{id}/notes:', r.data?.id || r.data);
+    return true;
+  } catch (err) {
+    console.warn('↪︎ /cases/{id}/notes failed', err.response?.data || err.message);
+  }
+
   return false;
 }
 
-// ---------- Webhooks ----------
+// ---------- Webhook ----------
 app.post('/incoming-whatsapp', async (req, res) => {
   const from = req.body.From || '';
   const message = req.body.Body || '';
   console.log(`📩 WhatsApp from ${from}: ${message}`);
 
-  // 1) Auth for this request cycle
   const session = await getSessionAuth();
   if (!session) return res.status(500).send('Auth failed');
-  const { csrf_token, session_id } = session;
-  const authHeaders = buildAuthHeaders(csrf_token, session_id);
 
-  // 2) Normalise phone → whatsapp email identity
+  const { csrf_token, session_id } = session;
+  const hdrs = authHeaders(csrf_token, session_id);
+
+  // map WhatsApp number -> synthetic email identity
   const phone = from.replace(/^whatsapp:/, '').replace(/^\+/, '');
   const email = `${phone}@whatsapp.stickershop.co.uk`;
   const name = from;
+  const subject = `WhatsApp: ${phone}`;
 
-  // 3) Ensure user exists
-  const requester_id = await findOrCreateUser(email, name, authHeaders);
+  // Ensure requester
+  const requester_id = await findOrCreateUser(email, name, hdrs);
   if (!requester_id) return res.status(500).send('User lookup/creation failed');
   console.log('✅ Requester ID:', requester_id);
 
-  const subject = `WhatsApp: ${phone}`;
-
   try {
-    // 4) Reuse or create case
-    let caseId = await findActiveCaseForRequester(requester_id, email, authHeaders);
+    // Reuse or create case
+    let caseId = await findActiveCaseForRequester(requester_id, email, hdrs);
 
     if (!caseId) {
-      // Create a new case WITHOUT contents first
       const create = await axios.post(`${KAYAKO_API_BASE}/cases.json`, {
         subject,
         requester_id
-        // channel: 'email' // optional; depends on schema
-      }, authHeaders);
+      }, hdrs);
       caseId = create.data?.data?.id || create.data?.id;
       console.log('📁 New case created:', caseId);
     } else {
       console.log('♻️ Appending to existing case:', caseId);
     }
 
-    // 5) Append WhatsApp text as PUBLIC message so agents can reply
-    const ok = await addPublicMessage(caseId, message, authHeaders, subject);
+    // Append as public message (with graceful fallbacks)
+    const ok = await addPublicMessage(caseId, message, hdrs, subject);
     if (!ok) {
       console.error('❌ Failed to append public message');
       return res.status(500).send('Message creation failed');
     }
 
-    // Twilio only needs a 200 OK; empty TwiML is fine
+    // Respond to Twilio
     res.type('text/xml').send('<Response></Response>');
   } catch (err) {
-    console.error('❌ Case error:', err.response?.data || err.message);
-    res.status(500).send('Case error');
+    console.error('❌ Case flow error:', err.response?.data || err.message);
+    res.status(500).send('Case flow error');
   }
 });
 
