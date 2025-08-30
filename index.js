@@ -1,155 +1,132 @@
-// index.js — WhatsApp ➜ Kayako via SendGrid (emails from pseudo-customer)
-// ---------------------------------------------------------------
-// Env required:
-//   SENDGRID_API_KEY=...            // SendGrid API key
-//   MAIL_TO=hello@stickershop.co.uk // Your Kayako support inbox address
-//   MAIL_FROM_DOMAIN=whatsapp.stickershop.co.uk
-//
-// Optional (to fetch & attach WhatsApp media):
-//   TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-//   TWILIO_AUTH_TOKEN=yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
-//
-// Twilio will POST application/x-www-form-urlencoded to /incoming-whatsapp
-// with fields like: From, Body, NumMedia, MediaUrl0, MediaContentType0, etc.
-
+// index.js — WhatsApp → Kayako via SendGrid (supports media attachments)
 const express = require('express');
 const bodyParser = require('body-parser');
+const axios = require('axios');
 const dotenv = require('dotenv');
 const sgMail = require('@sendgrid/mail');
-const axios = require('axios');
 
 dotenv.config();
-
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
-const MAIL_TO = process.env.MAIL_TO; // Kayako support email
-const MAIL_FROM_DOMAIN = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
-
-if (!SENDGRID_API_KEY || !MAIL_TO) {
-  console.error('❌ Missing SENDGRID_API_KEY or MAIL_TO env var');
-  process.exit(1);
-}
-sgMail.setApiKey(SENDGRID_API_KEY);
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// ---------- helpers ----------
-const escapeHtml = (s = '') =>
-  String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#039;');
+// --- Config ---
+const SEND_TO = process.env.MAIL_TO;                              // e.g. hello@stickershop.co.uk
+const FROM_DOMAIN = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
+const TWILIO_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 
-function normalisePhone(whatsFrom = '') {
-  // "whatsapp:+4479..." -> "4479..."
-  return String(whatsFrom).replace(/^whatsapp:/, '').replace(/^\+/, '');
+if (!process.env.SENDGRID_API_KEY) {
+  console.error('Missing SENDGRID_API_KEY');
 }
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
-function extFromMime(mime = '') {
-  // very light mapping
+// --- Helpers ---
+function guessExt(contentType = '') {
   const map = {
-    'image/jpeg': 'jpg',
-    'image/jpg': 'jpg',
-    'image/png': 'png',
-    'image/gif': 'gif',
-    'image/webp': 'webp',
-    'video/mp4': 'mp4',
-    'audio/ogg': 'ogg',
-    'audio/mpeg': 'mp3',
-    'application/pdf': 'pdf'
+    'image/jpeg': '.jpg',
+    'image/png': '.png',
+    'image/webp': '.webp',
+    'image/gif': '.gif',
+    'application/pdf': '.pdf',
+    'video/mp4': '.mp4',
+    'audio/ogg': '.ogg',
+    'audio/mpeg': '.mp3',
+    'text/plain': '.txt'
   };
-  return map[mime.toLowerCase()] || mime.split('/')[1] || 'bin';
+  return map[contentType.toLowerCase()] || '';
 }
 
-async function fetchTwilioMediaAsAttachments(reqBody) {
+async function fetchTwilioMedia(url) {
+  // Twilio media URLs require basic auth with SID/TOKEN
+  const resp = await axios.get(url, {
+    auth: { username: TWILIO_SID, password: TWILIO_TOKEN },
+    responseType: 'arraybuffer',
+    timeout: 30000
+  });
+  return Buffer.from(resp.data);
+}
+
+function buildFromAddress(phone) {
+  // phone like +4479… → 4479…@whatsapp.stickershop.co.uk
+  const num = String(phone || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
+  return `${num}@${FROM_DOMAIN}`;
+}
+
+// --- Webhook ---
+app.post('/incoming-whatsapp', async (req, res) => {
+  const from = req.body.From || '';
+  const caption = (req.body.Body || '').trim(); // may be empty when sending only media
+  const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
+
+  console.log(`📩 WhatsApp from ${from}: ${caption || '(no text)'} — media: ${numMedia}`);
+
+  // Collect attachments
   const attachments = [];
-  const notes = [];
+  let totalBytes = 0;
 
-  const num = parseInt(reqBody.NumMedia || '0', 10) || 0;
-  if (!num) return { attachments, notes };
-
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN;
-  const canFetch = Boolean(sid && token);
-
-  for (let i = 0; i < Math.min(num, 10); i++) { // sensible cap
-    const url = reqBody[`MediaUrl${i}`];
-    const type = reqBody[`MediaContentType${i}`] || 'application/octet-stream';
+  for (let i = 0; i < numMedia; i++) {
+    const url = req.body[`MediaUrl${i}`];
+    const type = req.body[`MediaContentType${i}`] || 'application/octet-stream';
     if (!url) continue;
 
-    if (canFetch) {
-      try {
-        const resp = await axios.get(url, {
-          auth: { username: sid, password: token },
-          responseType: 'arraybuffer',
-          timeout: 15000
-        });
-        const b64 = Buffer.from(resp.data).toString('base64');
-        const ext = extFromMime(type);
-        attachments.push({
-          content: b64,
-          filename: `whatsapp-media-${i + 1}.${ext}`,
-          type,
-          disposition: 'attachment'
-        });
-      } catch (err) {
-        notes.push(`(Could not fetch media ${i + 1}: ${err.message})`);
+    try {
+      const buf = await fetchTwilioMedia(url);
+      totalBytes += buf.length;
+
+      // Soft limit to avoid SendGrid’s ~30MB per message cap (Base64 inflates by ~33%)
+      if (totalBytes > 22 * 1024 * 1024) {
+        console.warn(`⚠️ Skipping media ${i} to keep email size reasonable.`);
+        continue;
       }
-    } else {
-      // If we can't fetch, include a note (Twilio URLs are short-lived & require auth).
-      notes.push(`(Media ${i + 1}: ${type} — configure TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN to attach)`);
+
+      const ext = guessExt(type);
+      const safeNum = from.replace(/\D/g, '');
+      const filename = `${safeNum}-wa-${i + 1}${ext}`;
+      const b64 = buf.toString('base64');
+
+      attachments.push({
+        content: b64,
+        filename,
+        type,
+        disposition: 'attachment'
+      });
+    } catch (err) {
+      console.error(`❌ Failed to fetch media ${i}:`, err.response?.status || err.message);
     }
   }
 
-  return { attachments, notes };
-}
+  // Ensure we send at least one character of text (SendGrid requirement)
+  let text = caption;
+  if (!text) {
+    text = attachments.length
+      ? `WhatsApp message from ${from} with ${attachments.length} attachment(s).`
+      : 'WhatsApp message (no text).';
+  }
 
-// ---------- webhook ----------
-app.post('/incoming-whatsapp', async (req, res) => {
+  const msg = {
+    to: SEND_TO,
+    from: buildFromAddress(from),
+    subject: `WhatsApp ${from}`,
+    text,
+    attachments
+  };
+
   try {
-    const from = req.body.From || '';    // e.g. "whatsapp:+4479..."
-    const text = req.body.Body || '';
-    const phone = normalisePhone(from);
-
-    console.log(`📩 WhatsApp from ${from}: ${text}`);
-
-    const pseudoFrom = `${phone}@${MAIL_FROM_DOMAIN}`;
-    const { attachments, notes } = await fetchTwilioMediaAsAttachments(req.body);
-
-    const htmlBody =
-      `<p><strong>WhatsApp from ${escapeHtml(phone)}</strong></p>` +
-      `<p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>` +
-      (notes.length ? `<hr><p><em>${notes.map(escapeHtml).join('<br>')}</em></p>` : '');
-
-    const msg = {
-      to: MAIL_TO,
-      from: { email: pseudoFrom, name: `WhatsApp ${phone}` },
-      replyTo: { email: pseudoFrom, name: `WhatsApp ${phone}` },
-      subject: `WhatsApp chat from ${phone}`,
-      text,
-      html: htmlBody,
-      attachments,
-      headers: {
-        'X-WhatsApp-Phone': phone
-      }
-    };
-
     await sgMail.send(msg);
-    console.log(`✉️  Emailed to Kayako as ${pseudoFrom} → ${MAIL_TO} (attachments: ${attachments.length})`);
-
-    // Twilio only needs 200 OK; empty TwiML is fine.
+    console.log(
+      `✉️  Emailed to Kayako as ${msg.from} → ${SEND_TO} (attachments: ${attachments.length})`
+    );
     res.type('text/xml').send('<Response></Response>');
-  } catch (err) {
-    console.error('❌ Send failed:', err?.response?.body || err.message);
-    res.status(500).send('Email send failed');
+  } catch (e) {
+    console.error('❌ Send failed:', e.response?.body || e.message || e);
+    res.status(500).send('SendGrid error');
   }
 });
 
-// ---------- health ----------
+// Health
 app.get('/', (_req, res) => res.send('Webhook is running ✅'));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Webhook server on :${PORT}`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
