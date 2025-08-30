@@ -1,188 +1,155 @@
-// index.js – WhatsApp → Kayako bridge (post AS REQUESTER + correct case reuse)
+// index.js — WhatsApp ➜ Kayako via SendGrid (emails from pseudo-customer)
+// ---------------------------------------------------------------
+// Env required:
+//   SENDGRID_API_KEY=...            // SendGrid API key
+//   MAIL_TO=hello@stickershop.co.uk // Your Kayako support inbox address
+//   MAIL_FROM_DOMAIN=whatsapp.stickershop.co.uk
+//
+// Optional (to fetch & attach WhatsApp media):
+//   TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+//   TWILIO_AUTH_TOKEN=yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
+//
+// Twilio will POST application/x-www-form-urlencoded to /incoming-whatsapp
+// with fields like: From, Body, NumMedia, MediaUrl0, MediaContentType0, etc.
+
 const express = require('express');
 const bodyParser = require('body-parser');
-const axios = require('axios');
 const dotenv = require('dotenv');
+const sgMail = require('@sendgrid/mail');
+const axios = require('axios');
+
 dotenv.config();
+
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
+const MAIL_TO = process.env.MAIL_TO; // Kayako support email
+const MAIL_FROM_DOMAIN = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
+
+if (!SENDGRID_API_KEY || !MAIL_TO) {
+  console.error('❌ Missing SENDGRID_API_KEY or MAIL_TO env var');
+  process.exit(1);
+}
+sgMail.setApiKey(SENDGRID_API_KEY);
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-const KAYAKO_BASE_URL = 'https://stickershop.kayako.com';
-const KAYAKO_API_BASE = `${KAYAKO_BASE_URL}/api/v1`;
+// ---------- helpers ----------
+const escapeHtml = (s = '') =>
+  String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 
-// ---------------- Session / Auth ----------------
-async function getSessionAuth() {
-  try {
-    const resp = await axios.get(`${KAYAKO_API_BASE}/cases.json`, {
-      auth: {
-        username: process.env.KAYAKO_USERNAME,
-        password: process.env.KAYAKO_PASSWORD
-      },
-      headers: { 'Content-Type': 'application/json' },
-      timeout: 15000
-    });
-
-    const csrf = resp.headers['x-csrf-token'];
-    const session_id = resp.data?.session_id;
-
-    console.log('🛡 CSRF Token:', csrf);
-    console.log('🍪 Session ID:', session_id);
-
-    if (!csrf || !session_id) return null;
-    return { csrf, session_id };
-  } catch (e) {
-    console.error('❌ Auth error:', e.response?.data || e.message);
-    return null;
-  }
+function normalisePhone(whatsFrom = '') {
+  // "whatsapp:+4479..." -> "4479..."
+  return String(whatsFrom).replace(/^whatsapp:/, '').replace(/^\+/, '');
 }
 
-function kayakoClient({ csrf, session_id }) {
-  return axios.create({
-    baseURL: KAYAKO_API_BASE,
-    auth: {
-      username: process.env.KAYAKO_USERNAME,
-      password: process.env.KAYAKO_PASSWORD
-    },
-    headers: {
-      'X-CSRF-Token': csrf,
-      'Cookie': `kayako_session_id=${session_id}`,
-      'Content-Type': 'application/json'
-    },
-    timeout: 20000
-  });
+function extFromMime(mime = '') {
+  // very light mapping
+  const map = {
+    'image/jpeg': 'jpg',
+    'image/jpg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp',
+    'video/mp4': 'mp4',
+    'audio/ogg': 'ogg',
+    'audio/mpeg': 'mp3',
+    'application/pdf': 'pdf'
+  };
+  return map[mime.toLowerCase()] || mime.split('/')[1] || 'bin';
 }
 
-// ---------------- Users ----------------
-async function findOrCreateUser(client, email, name) {
-  try {
-    console.log('🔍 Searching for user with email:', email);
-    const sr = await client.get(`/search.json`, {
-      params: { query: email, resources: 'users' }
-    });
+async function fetchTwilioMediaAsAttachments(reqBody) {
+  const attachments = [];
+  const notes = [];
 
-    const hits = sr.data?.data || [];
-    const matched = hits.find(u => u.resource === 'user' && (u.snippet === email || u.email === email));
-    if (matched) {
-      console.log('✅ Exact user match found:', matched.id);
-      return matched.id;
-    }
+  const num = parseInt(reqBody.NumMedia || '0', 10) || 0;
+  if (!num) return { attachments, notes };
 
-    console.log('👤 User not found, creating…');
-    const cr = await client.post(`/users.json`, {
-      full_name: name,
-      role_id: 4,
-      email
-    });
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  const canFetch = Boolean(sid && token);
 
-    const uid = cr.data?.data?.id || cr.data?.id;
-    console.log('✅ User created:', uid);
-    return uid;
-  } catch (e) {
-    console.error('❌ User lookup/create failed:', e.response?.data || e.message);
-    return null;
-  }
-}
+  for (let i = 0; i < Math.min(num, 10); i++) { // sensible cap
+    const url = reqBody[`MediaUrl${i}`];
+    const type = reqBody[`MediaContentType${i}`] || 'application/octet-stream';
+    if (!url) continue;
 
-// ---------------- Case helpers ----------------
-
-// Find the customer’s most recent open/active case using identity filters.
-// Kayako “Retrieve all cases” supports identity_type + identity_value and a status filter.
-// (Docs show identity filters; results are ordered by updated_at desc.)  [oai_citation:1‡developer.kayako.com](https://developer.kayako.com/api/v1/cases/cases/)
-async function findLatestOpenCaseForIdentity(client, email) {
-  try {
-    const r = await client.get(`/cases.json`, {
-      params: {
-        identity_type: 'EMAIL',
-        identity_value: email,
-        status: 'NEW,OPEN,PENDING', // exclude CLOSED/COMPLETED
-        limit: 1
+    if (canFetch) {
+      try {
+        const resp = await axios.get(url, {
+          auth: { username: sid, password: token },
+          responseType: 'arraybuffer',
+          timeout: 15000
+        });
+        const b64 = Buffer.from(resp.data).toString('base64');
+        const ext = extFromMime(type);
+        attachments.push({
+          content: b64,
+          filename: `whatsapp-media-${i + 1}.${ext}`,
+          type,
+          disposition: 'attachment'
+        });
+      } catch (err) {
+        notes.push(`(Could not fetch media ${i + 1}: ${err.message})`);
       }
-    });
-    const caseId = r.data?.data?.[0]?.id || null;
-    if (caseId) console.log('🔎 Reusing customer case:', caseId);
-    return caseId;
-  } catch (e) {
-    console.warn('⚠️ Could not list cases for identity:', e.response?.data || e.message);
-    return null;
-  }
-}
-
-// Create a NEW case as the requester, with source=MESSENGER (so it isn’t “from agent”)
-async function createNewCaseAsRequester(client, requester_id, from, contents) {
-  const payload = {
-    subject: `WhatsApp: ${from.replace('whatsapp:', '')}`,
-    requester_id,
-    channel: 'MAIL',            // public post
-    source: 'MESSENGER',        // origin attribution
-    contents                   : String(contents || '')
-  };
-
-  const resp = await client.post(`/cases.json`, payload);
-  const caseId = resp.data?.data?.id || resp.data?.id;
-  return { id: caseId, raw: resp.data };
-}
-
-// Append a PUBLIC reply AS THE REQUESTER on an existing case.
-// Per docs, /cases/{id}/reply.json accepts: contents, channel, requester_id, source.  [oai_citation:2‡developer.kayako.com](https://developer.kayako.com/api/v1/cases/cases/)
-async function replyAsRequester(client, caseId, requester_id, contents) {
-  const payload = {
-    contents    : String(contents || ''),
-    channel     : 'MAIL',       // public channel (NOTE would be private)
-    requester_id: requester_id, // <- THIS attributes the post to the customer
-    source      : 'MESSENGER'   // attribute origin
-  };
-
-  return client.post(`/cases/${caseId}/reply.json`, payload);
-}
-
-// ---------------- Webhook ----------------
-app.post('/incoming-whatsapp', async (req, res) => {
-  const from = req.body.From;         // e.g. "whatsapp:+4479..."
-  const body = req.body.Body || '';
-
-  console.log(`📩 WhatsApp from ${from}: ${body}`);
-
-  const session = await getSessionAuth();
-  if (!session) return res.status(500).send('Auth failed');
-  const client = kayakoClient(session);
-
-  // Build a stable pseudo-email for the WhatsApp identity
-  const phone = String(from || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
-  const email = `${phone}@whatsapp.stickershop.co.uk`;
-  const displayName = from;
-
-  // Ensure a user exists
-  const requester_id = await findOrCreateUser(client, email, displayName);
-  if (!requester_id) return res.status(500).send('User lookup/creation failed');
-  console.log('✅ Requester ID:', requester_id);
-
-  try {
-    // Reuse an open case for THIS identity (not your agent’s)
-    let caseId = await findLatestOpenCaseForIdentity(client, email);
-
-    if (caseId) {
-      console.log('♻️ Appending to existing case as requester:', caseId);
-      await replyAsRequester(client, caseId, requester_id, body);
-      console.log('✉️ Public reply (as requester) appended to case:', caseId);
     } else {
-      console.log('🆕 No open case for identity; creating a new one as requester…');
-      const created = await createNewCaseAsRequester(client, requester_id, from, body);
-      console.log('📁 Case created:', created.raw);
-      caseId = created.id;
+      // If we can't fetch, include a note (Twilio URLs are short-lived & require auth).
+      notes.push(`(Media ${i + 1}: ${type} — configure TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN to attach)`);
     }
+  }
 
-    // Twilio expects 200 OK; an empty TwiML is fine.
-    res.type('text/xml').send('<Response/>');
-  } catch (e) {
-    console.error('❌ Kayako error:', e.response?.data || e.message);
-    res.status(500).send('Kayako error');
+  return { attachments, notes };
+}
+
+// ---------- webhook ----------
+app.post('/incoming-whatsapp', async (req, res) => {
+  try {
+    const from = req.body.From || '';    // e.g. "whatsapp:+4479..."
+    const text = req.body.Body || '';
+    const phone = normalisePhone(from);
+
+    console.log(`📩 WhatsApp from ${from}: ${text}`);
+
+    const pseudoFrom = `${phone}@${MAIL_FROM_DOMAIN}`;
+    const { attachments, notes } = await fetchTwilioMediaAsAttachments(req.body);
+
+    const htmlBody =
+      `<p><strong>WhatsApp from ${escapeHtml(phone)}</strong></p>` +
+      `<p>${escapeHtml(text).replace(/\n/g, '<br>')}</p>` +
+      (notes.length ? `<hr><p><em>${notes.map(escapeHtml).join('<br>')}</em></p>` : '');
+
+    const msg = {
+      to: MAIL_TO,
+      from: { email: pseudoFrom, name: `WhatsApp ${phone}` },
+      replyTo: { email: pseudoFrom, name: `WhatsApp ${phone}` },
+      subject: `WhatsApp chat from ${phone}`,
+      text,
+      html: htmlBody,
+      attachments,
+      headers: {
+        'X-WhatsApp-Phone': phone
+      }
+    };
+
+    await sgMail.send(msg);
+    console.log(`✉️  Emailed to Kayako as ${pseudoFrom} → ${MAIL_TO} (attachments: ${attachments.length})`);
+
+    // Twilio only needs 200 OK; empty TwiML is fine.
+    res.type('text/xml').send('<Response></Response>');
+  } catch (err) {
+    console.error('❌ Send failed:', err?.response?.body || err.message);
+    res.status(500).send('Email send failed');
   }
 });
 
-// Health
+// ---------- health ----------
 app.get('/', (_req, res) => res.send('Webhook is running ✅'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Webhook server on :${PORT}`));
