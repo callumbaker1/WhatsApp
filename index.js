@@ -182,7 +182,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       : 'WhatsApp message (no text).');
 
   const subject = existingCaseId
-    ? `${buildSubjectBase(from)} [Case #${existingCaseId}]`
+    ? `${buildSubjectBase(from)}`
     : buildSubjectBase(from);
 
   const msg = {
