@@ -1,9 +1,29 @@
-// index.js — WhatsApp <-> Kayako bridge
+// index.js — WhatsApp ↔ Kayako bridge
+// - Twilio WhatsApp webhook  -> SendGrid email to Kayako (supports media)
+// - SendGrid Inbound Parse   -> Twilio WhatsApp outbound (agent replies back to customer)
+//
+// Install:
+//   npm i express body-parser axios dotenv @sendgrid/mail multer twilio
+//
+// Env you need (Render):
+//   SENDGRID_API_KEY=...               // SendGrid API key
+//   MAIL_TO=hello@stickershop.co.uk    // Kayako mailbox address
+//   MAIL_FROM_DOMAIN=whatsapp.stickershop.co.uk
+//   TWILIO_ACCOUNT_SID=ACxxxxxxxx
+//   TWILIO_AUTH_TOKEN=xxxxxxxx
+//   TWILIO_WHATSAPP_FROM=whatsapp:+44XXXXXXXXXX
+//   (optional) KAYAKO_BASE_URL=https://stickershop.kayako.com
+//   (optional) KAYAKO_USERNAME=...     // to look up open case for subject threading
+//   (optional) KAYAKO_PASSWORD=...
+//   (optional) KAYAKO_FROM_ALLOWLIST=hello@stickershop.co.uk,another@stickershop.co.uk
+//   (optional) SG_INBOUND_SECRET=mysecret   // if you want to validate inbound parse via header
+
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const dotenv = require('dotenv');
 const sgMail = require('@sendgrid/mail');
+const multer = require('multer');
 const twilio = require('twilio');
 
 dotenv.config();
@@ -13,24 +33,32 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 // ---------- Config ----------
-const SEND_TO       = process.env.MAIL_TO;                          // e.g. hello@stickershop.co.uk
-const FROM_DOMAIN   = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
+const SEND_TO      = process.env.MAIL_TO;
+const FROM_DOMAIN  = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
+const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM;
 
-const TWILIO_SID    = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_TOKEN  = process.env.TWILIO_AUTH_TOKEN;
-const TW_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM;          // e.g. 'whatsapp:+44...'
-const tClient       = twilio(TWILIO_SID, TWILIO_TOKEN);
+const KAYAKO_BASE  = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
+const KAYAKO_API   = `${KAYAKO_BASE}/api/v1`;
+const KAYAKO_USER  = process.env.KAYAKO_USERNAME || '';
+const KAYAKO_PASS  = process.env.KAYAKO_PASSWORD || '';
 
-const KAYAKO_BASE   = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
-const KAYAKO_API    = `${KAYAKO_BASE}/api/v1`;
-const KAYAKO_USER   = process.env.KAYAKO_USERNAME;
-const KAYAKO_PASS   = process.env.KAYAKO_PASSWORD;
+const FROM_ALLOW   = (process.env.KAYAKO_FROM_ALLOWLIST || 'hello@stickershop.co.uk')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+const INBOUND_SECRET = process.env.SG_INBOUND_SECRET || '';
 
 if (!process.env.SENDGRID_API_KEY) console.error('❌ Missing SENDGRID_API_KEY');
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
-// ---------- Helpers ----------
-function kayakoClient() {
+const tClient = twilio(TWILIO_SID, TWILIO_TOKEN);
+
+// ---------- Utils ----------
+function kayakoClientOptional() {
+  if (!KAYAKO_USER || !KAYAKO_PASS) return null;
   return axios.create({
     baseURL: KAYAKO_API,
     auth: { username: KAYAKO_USER, password: KAYAKO_PASS },
@@ -40,17 +68,9 @@ function kayakoClient() {
 }
 
 function buildFromAddress(phone) {
+  // "whatsapp:+4479..." → "4479...@whatsapp.stickershop.co.uk"
   const num = String(phone || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
   return `${num}@${FROM_DOMAIN}`;
-}
-
-function extractPhoneFromPseudoEmail(email) {
-  // matches 4479...@whatsapp.stickershop.co.uk
-  const m = String(email || '').trim().match(/^(\d+)\@([^@]+)$/i);
-  if (!m) return null;
-  // optionally check domain:
-  // if (!m[2].toLowerCase().endsWith(FROM_DOMAIN.toLowerCase())) return null;
-  return `whatsapp:+${m[1]}`;
 }
 
 function guessExt(contentType = '') {
@@ -69,6 +89,7 @@ function guessExt(contentType = '') {
 }
 
 async function fetchTwilioMedia(url) {
+  // Twilio media URLs require basic auth with SID/TOKEN
   const resp = await axios.get(url, {
     auth: { username: TWILIO_SID, password: TWILIO_TOKEN },
     responseType: 'arraybuffer',
@@ -77,14 +98,15 @@ async function fetchTwilioMedia(url) {
   return Buffer.from(resp.data);
 }
 
-function buildSubject(from, caseId) {
-  const base = `WhatsApp message from ${from}`;
-  return caseId ? `${base} [Case #${caseId}]` : base;
+function buildSubjectBase(from) {
+  return `WhatsApp message from ${from}`;
 }
 
 async function findLatestOpenCaseIdByIdentity(email) {
   try {
-    const client = kayakoClient();
+    const client = kayakoClientOptional();
+    if (!client) return null;
+
     const r = await client.get('/cases.json', {
       params: {
         identity_type: 'EMAIL',
@@ -104,17 +126,19 @@ async function findLatestOpenCaseIdByIdentity(email) {
   }
 }
 
-// ---------- WhatsApp -> Kayako (email in) ----------
+// ---------- WhatsApp → Kayako (email via SendGrid) ----------
 app.post('/incoming-whatsapp', async (req, res) => {
-  const from      = req.body.From || '';
-  const caption   = (req.body.Body || '').trim();
-  const numMedia  = parseInt(req.body.NumMedia || '0', 10) || 0;
+  const from = req.body.From || '';              // "whatsapp:+4479…"
+  const caption = (req.body.Body || '').trim();  // may be empty if only media
+  const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
 
   console.log(`📩 WhatsApp from ${from}: ${caption || '(no text)'} — media: ${numMedia}`);
 
+  // Build pseudo "From" identity for Kayako threading per requester
   const fromEmail = buildFromAddress(from);
   const existingCaseId = await findLatestOpenCaseIdByIdentity(fromEmail);
 
+  // Collect attachments from Twilio
   const attachments = [];
   let totalBytes = 0;
 
@@ -126,15 +150,20 @@ app.post('/incoming-whatsapp', async (req, res) => {
     try {
       const buf = await fetchTwilioMedia(url);
       totalBytes += buf.length;
+
+      // Keep < ~22MB raw (base64 expands to ~30MB SendGrid cap)
       if (totalBytes > 22 * 1024 * 1024) {
         console.warn(`⚠️ Skipping media ${i} to keep email size reasonable.`);
         continue;
       }
-      const ext     = guessExt(type);
-      const safeNum = from.replace(/\D/g, '');
+
+      const ext      = guessExt(type);
+      const safeNum  = from.replace(/\D/g, '');
       const filename = `${safeNum}-wa-${i + 1}${ext}`;
+      const b64      = buf.toString('base64');
+
       attachments.push({
-        content: buf.toString('base64'),
+        content: b64,
         filename,
         type,
         disposition: 'attachment'
@@ -150,10 +179,14 @@ app.post('/incoming-whatsapp', async (req, res) => {
       ? `WhatsApp message from ${from} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
+  const subject =
+    existingCaseId ? `${buildSubjectBase(from)} [Case #${existingCaseId}]`
+                   : buildSubjectBase(from);
+
   const msg = {
     to: SEND_TO,
     from: { email: fromEmail, name: from },
-    subject: buildSubject(from, existingCaseId),
+    subject,
     text: bodyText,
     attachments,
     headers: {
@@ -165,65 +198,89 @@ app.post('/incoming-whatsapp', async (req, res) => {
   try {
     await sgMail.send(msg);
     console.log(`✉️  Emailed to Kayako as ${msg.from.email} → ${SEND_TO} (attachments: ${attachments.length})`);
-    res.type('text/xml').send('<Response></Response>');
+    res.type('text/xml').send('<Response></Response>'); // Twilio OK
   } catch (e) {
     console.error('❌ Send failed:', e.response?.body || e.message || e);
     res.status(500).send('SendGrid error');
   }
 });
 
-// ---------- Kayako -> WhatsApp (reply out) ----------
-app.post('/kayako-outbound', async (req, res) => {
+// ---------- SendGrid Inbound Parse → WhatsApp (agent reply back to customer) ----------
+const upload = multer({ storage: multer.memoryStorage() });
+
+function firstAddress(str = '') {
+  const m = String(str).match(/<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?/i);
+  return m ? m[1].toLowerCase() : '';
+}
+
+function toWhatsAppNumber(toField = '', envelope = '') {
+  // Prefer the raw RCPT TO from 'envelope'
   try {
-    // Be very tolerant about structures from Kayako Automations
-    const b = req.body || {};
-    const text =
-      b.message || b.contents || b.text || b.plain_body ||
-      b.post?.plain_body || b.post?.body || '';
+    const env = JSON.parse(envelope || '{}');
+    const to = (env.to && env.to[0]) || '';
+    const local = to.split('@')[0];
+    const digits = String(local).replace(/\D/g, '');
+    return digits ? `whatsapp:+${digits}` : null;
+  } catch { /* ignore */ }
 
-    const requesterEmail =
-      b.requester_email || b.email || b.from_email ||
-      b.case?.requester?.email || b.requester?.email || '';
+  // Fallback: parse the "to" header
+  const addr = firstAddress(toField);
+  const local = addr.split('@')[0];
+  const digits = local.replace(/\D/g, '');
+  return digits ? `whatsapp:+${digits}` : null;
+}
 
-    // You can also allow Kayako to pass the number explicitly:
-    const explicitTo =
-      b.to || b.phone || b.whatsapp_to || b.requester_phone || '';
-
-    console.log('🔔 Kayako webhook body:', JSON.stringify(b, null, 2));
-
-    // Basic validation
-    if (!text || !text.trim()) {
-      return res.status(200).json({ ok: false, error: 'bad_payload', why: 'missing_text' });
+app.post('/sg-inbound', upload.any(), async (req, res) => {
+  try {
+    // Optional shared-secret header for simple auth
+    if (INBOUND_SECRET) {
+      const got = req.headers['x-inbound-secret'];
+      if (got !== INBOUND_SECRET) {
+        console.warn('⛔️ Inbound secret mismatch');
+        return res.status(403).send('forbidden');
+      }
     }
 
-    // Work out the WhatsApp destination
-    let toWhatsApp = '';
-    if (explicitTo && /^(\+?\d+)$/.test(String(explicitTo))) {
-      toWhatsApp = 'whatsapp:' + explicitTo.replace(/^whatsapp:/, '').replace(/^\+?/, '+');
-    } else {
-      const fromPseudo = requesterEmail && extractPhoneFromPseudoEmail(requesterEmail);
-      if (fromPseudo) toWhatsApp = fromPseudo;
+    const { from, to, envelope, subject, text, html } = req.body || {};
+
+    // Optionally ensure the agent reply comes from your helpdesk mailbox
+    const fromAddr = firstAddress(from);
+    if (FROM_ALLOW.length && !FROM_ALLOW.includes(fromAddr)) {
+      console.log('⛔️ Ignoring email from non-allowlisted sender:', fromAddr);
+      return res.status(200).send('ignored');
     }
 
-    if (!toWhatsApp) {
-      return res.status(200).json({ ok: false, error: 'bad_payload', why: 'missing_destination' });
-    }
-    if (!TW_WHATSAPP_FROM) {
-      return res.status(500).json({ ok: false, error: 'server_misconfig', why: 'TWILIO_WHATSAPP_FROM missing' });
+    const waTo = toWhatsAppNumber(to, envelope);
+    if (!waTo) {
+      console.log('⛔️ Could not derive WhatsApp number from:', to, envelope);
+      return res.status(200).send('no-to');
     }
 
-    // Send via Twilio WhatsApp
-    const resp = await tClient.messages.create({
-      from: TW_WHATSAPP_FROM,
-      to: toWhatsApp,
-      body: text.trim()
+    // Prefer plain text; fallback to stripped HTML
+    let body = (text || '').trim();
+    if (!body && html) {
+      body = String(html).replace(/<[^>]+>/g, ' ')
+                         .replace(/\s+/g, ' ')
+                         .trim()
+                         .slice(0, 1600);
+    }
+    if (!body) body = '(no text)';
+
+    // NOTE: If you want to relay attachments, upload req.files to public storage (S3/R2)
+    // and include mediaUrl: [url1, url2] below.
+
+    const msg = await tClient.messages.create({
+      from: WA_FROM,  // e.g. "whatsapp:+44..."
+      to: waTo,
+      body
+      // mediaUrl: ['https://public-url/image.jpg'] // optional once you host files
     });
 
-    console.log('➡️  Sent WhatsApp:', { sid: resp.sid, to: toWhatsApp });
-    return res.status(200).json({ ok: true, sid: resp.sid });
+    console.log('✅ Relayed Kayako reply to', waTo, 'SID:', msg.sid, 'Subject:', subject || '(no subject)');
+    return res.status(200).send('ok');
   } catch (err) {
-    console.error('❌ Outbound error:', err.response?.data || err.message || err);
-    return res.status(500).json({ ok: false, error: 'exception' });
+    console.error('❌ /sg-inbound error:', err.response?.data || err.message || err);
+    return res.status(500).send('error');
   }
 });
 
