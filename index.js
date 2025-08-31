@@ -1,22 +1,19 @@
 // index.js — WhatsApp ↔ Kayako bridge
 // - Twilio WhatsApp webhook  -> SendGrid email to Kayako (supports media)
-// - SendGrid Inbound Parse   -> Twilio WhatsApp outbound (agent replies back to customer)
+// - SendGrid Inbound Parse   -> Twilio WhatsApp outbound (agent replies)
 //
-// Install:
-//   npm i express body-parser axios dotenv @sendgrid/mail multer twilio
-//
-// Env you need (Render):
+// Env (Render):
 //   SENDGRID_API_KEY=...               // SendGrid API key
-//   MAIL_TO=hello@stickershop.co.uk    // Kayako mailbox address
+//   MAIL_TO=hello@stickershop.co.uk    // Kayako mailbox
 //   MAIL_FROM_DOMAIN=whatsapp.stickershop.co.uk
-//   TWILIO_ACCOUNT_SID=ACxxxxxxxx
-//   TWILIO_AUTH_TOKEN=xxxxxxxx
-//   TWILIO_WHATSAPP_FROM=whatsapp:+44XXXXXXXXXX
+//   TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+//   TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+//   TWILIO_WHATSAPP_FROM=whatsapp:+44XXXXXXXXXX        // MUST include whatsapp: prefix
 //   (optional) KAYAKO_BASE_URL=https://stickershop.kayako.com
-//   (optional) KAYAKO_USERNAME=...     // to look up open case for subject threading
+//   (optional) KAYAKO_USERNAME=...     // for subject threading helper
 //   (optional) KAYAKO_PASSWORD=...
 //   (optional) KAYAKO_FROM_ALLOWLIST=hello@stickershop.co.uk,another@stickershop.co.uk
-//   (optional) SG_INBOUND_SECRET=mysecret   // if you want to validate inbound parse via header
+//   (optional) SG_INBOUND_SECRET=mysecret   // simple inbound auth
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -37,7 +34,7 @@ const SEND_TO      = process.env.MAIL_TO;
 const FROM_DOMAIN  = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
 const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM;
+const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM || '';
 
 const KAYAKO_BASE  = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
 const KAYAKO_API   = `${KAYAKO_BASE}/api/v1`;
@@ -56,7 +53,12 @@ sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 const tClient = twilio(TWILIO_SID, TWILIO_TOKEN);
 
-// ---------- Utils ----------
+// Validate WA_FROM at boot to catch the common mistake
+if (!/^whatsapp:\+\d{6,16}$/.test(WA_FROM || '')) {
+  console.error('❌ TWILIO_WHATSAPP_FROM must look like "whatsapp:+4479XXXXXXXX". Current value:', WA_FROM);
+}
+
+// ---------- Helpers ----------
 function kayakoClientOptional() {
   if (!KAYAKO_USER || !KAYAKO_PASS) return null;
   return axios.create({
@@ -124,6 +126,29 @@ async function findLatestOpenCaseIdByIdentity(email) {
     console.warn('⚠️ Case lookup failed:', e.response?.data || e.message);
     return null;
   }
+}
+
+function firstAddress(str = '') {
+  const m = String(str).match(/<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?/i);
+  return m ? m[1].toLowerCase() : '';
+}
+
+function toWhatsAppNumber(toField = '', envelope = '') {
+  // Prefer RCPT TO from 'envelope' (SendGrid best source)
+  try {
+    const env = JSON.parse(envelope || '{}');
+    const arr = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
+    const to = arr.find(addr => String(addr).toLowerCase().endsWith(`@${FROM_DOMAIN}`)) || arr[0] || '';
+    const local = (to || '').split('@')[0];
+    const digits = String(local).replace(/\D/g, '');
+    return digits ? `whatsapp:+${digits}` : null;
+  } catch { /* ignore */ }
+
+  // Fallback: parse the "to" header
+  const addr = firstAddress(toField);
+  const local = (addr || '').split('@')[0];
+  const digits = String(local).replace(/\D/g, '');
+  return digits ? `whatsapp:+${digits}` : null;
 }
 
 // ---------- WhatsApp → Kayako (email via SendGrid) ----------
@@ -208,28 +233,6 @@ app.post('/incoming-whatsapp', async (req, res) => {
 // ---------- SendGrid Inbound Parse → WhatsApp (agent reply back to customer) ----------
 const upload = multer({ storage: multer.memoryStorage() });
 
-function firstAddress(str = '') {
-  const m = String(str).match(/<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?/i);
-  return m ? m[1].toLowerCase() : '';
-}
-
-function toWhatsAppNumber(toField = '', envelope = '') {
-  // Prefer the raw RCPT TO from 'envelope'
-  try {
-    const env = JSON.parse(envelope || '{}');
-    const to = (env.to && env.to[0]) || '';
-    const local = to.split('@')[0];
-    const digits = String(local).replace(/\D/g, '');
-    return digits ? `whatsapp:+${digits}` : null;
-  } catch { /* ignore */ }
-
-  // Fallback: parse the "to" header
-  const addr = firstAddress(toField);
-  const local = addr.split('@')[0];
-  const digits = local.replace(/\D/g, '');
-  return digits ? `whatsapp:+${digits}` : null;
-}
-
 app.post('/sg-inbound', upload.any(), async (req, res) => {
   try {
     // Optional shared-secret header for simple auth
@@ -243,7 +246,6 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
 
     const { from, to, envelope, subject, text, html } = req.body || {};
 
-    // Optionally ensure the agent reply comes from your helpdesk mailbox
     const fromAddr = firstAddress(from);
     if (FROM_ALLOW.length && !FROM_ALLOW.includes(fromAddr)) {
       console.log('⛔️ Ignoring email from non-allowlisted sender:', fromAddr);
@@ -266,14 +268,23 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
     }
     if (!body) body = '(no text)';
 
-    // NOTE: If you want to relay attachments, upload req.files to public storage (S3/R2)
-    // and include mediaUrl: [url1, url2] below.
+    // Validate channel pair BEFORE sending
+    if (!/^whatsapp:\+\d{6,16}$/.test(WA_FROM)) {
+      console.error('❌ TWILIO_WHATSAPP_FROM is invalid or missing the "whatsapp:" prefix:', WA_FROM);
+      return res.status(500).send('bad-from');
+    }
+    if (!/^whatsapp:\+\d{6,16}$/.test(waTo)) {
+      console.error('❌ Derived WhatsApp "to" is invalid:', waTo);
+      return res.status(200).send('bad-to');
+    }
+
+    console.log('➡️  Sending via Twilio WhatsApp\n    FROM:', WA_FROM, '\n    TO  :', waTo, '\n    BODY:', body.slice(0, 160));
 
     const msg = await tClient.messages.create({
       from: WA_FROM,  // e.g. "whatsapp:+44..."
       to: waTo,
       body
-      // mediaUrl: ['https://public-url/image.jpg'] // optional once you host files
+      // If you later host attachments publicly, add mediaUrl: ['https://...']
     });
 
     console.log('✅ Relayed Kayako reply to', waTo, 'SID:', msg.sid, 'Subject:', subject || '(no subject)');
