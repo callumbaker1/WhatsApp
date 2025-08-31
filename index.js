@@ -1,12 +1,10 @@
-// index.js — WhatsApp ⇄ Kayako
-// Inbound: WhatsApp → SendGrid email → Kayako (existing flow)
-// Outbound: Kayako (agent public reply via webhook) → Twilio WhatsApp
-
+// index.js — WhatsApp <-> Kayako bridge
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const dotenv = require('dotenv');
 const sgMail = require('@sendgrid/mail');
+const twilio = require('twilio');
 
 dotenv.config();
 
@@ -15,43 +13,44 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 // ---------- Config ----------
-const SEND_TO      = process.env.MAIL_TO;                          // e.g. hello@stickershop.co.uk
-const FROM_DOMAIN  = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
-const TW_SID       = process.env.TWILIO_ACCOUNT_SID;
-const TW_TOKEN     = process.env.TWILIO_AUTH_TOKEN;
-const TW_FROM      = process.env.TWILIO_WHATSAPP_FROM;             // e.g. 'whatsapp:+447911123456'
+const SEND_TO       = process.env.MAIL_TO;                          // e.g. hello@stickershop.co.uk
+const FROM_DOMAIN   = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
 
-const KAYAKO_BASE  = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
-const KAYAKO_API   = `${KAYAKO_BASE}/api/v1`;
-const KY_USER      = process.env.KAYAKO_USERNAME;
-const KY_PASS      = process.env.KAYAKO_PASSWORD;
-const KY_SECRET    = process.env.KAYAKO_WEBHOOK_SECRET || '';
+const TWILIO_SID    = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_TOKEN  = process.env.TWILIO_AUTH_TOKEN;
+const TW_WHATSAPP_FROM = process.env.TWILIO_WHATSAPP_FROM;          // e.g. 'whatsapp:+44...'
+const tClient       = twilio(TWILIO_SID, TWILIO_TOKEN);
+
+const KAYAKO_BASE   = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
+const KAYAKO_API    = `${KAYAKO_BASE}/api/v1`;
+const KAYAKO_USER   = process.env.KAYAKO_USERNAME;
+const KAYAKO_PASS   = process.env.KAYAKO_PASSWORD;
 
 if (!process.env.SENDGRID_API_KEY) console.error('❌ Missing SENDGRID_API_KEY');
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
-// ---------- Shared helpers ----------
+// ---------- Helpers ----------
 function kayakoClient() {
   return axios.create({
     baseURL: KAYAKO_API,
-    auth: { username: KY_USER, password: KY_PASS },
+    auth: { username: KAYAKO_USER, password: KAYAKO_PASS },
     headers: { 'Content-Type': 'application/json' },
     timeout: 15000
   });
 }
 
 function buildFromAddress(phone) {
-  // "whatsapp:+4479…" → "4479…@whatsapp.stickershop.co.uk"
   const num = String(phone || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
   return `${num}@${FROM_DOMAIN}`;
 }
 
-function emailToWhatsappAddress(email) {
-  // "4479…@whatsapp.stickershop.co.uk" → "whatsapp:+4479…"
-  const [local, domain] = String(email || '').trim().toLowerCase().split('@');
-  if (!local || domain !== FROM_DOMAIN.toLowerCase()) return null;
-  const digits = local.replace(/\D/g, '');
-  return digits ? `whatsapp:+${digits}` : null;
+function extractPhoneFromPseudoEmail(email) {
+  // matches 4479...@whatsapp.stickershop.co.uk
+  const m = String(email || '').trim().match(/^(\d+)\@([^@]+)$/i);
+  if (!m) return null;
+  // optionally check domain:
+  // if (!m[2].toLowerCase().endsWith(FROM_DOMAIN.toLowerCase())) return null;
+  return `whatsapp:+${m[1]}`;
 }
 
 function guessExt(contentType = '') {
@@ -70,9 +69,8 @@ function guessExt(contentType = '') {
 }
 
 async function fetchTwilioMedia(url) {
-  // Twilio media URLs require basic auth with SID/TOKEN
   const resp = await axios.get(url, {
-    auth: { username: TW_SID, password: TW_TOKEN },
+    auth: { username: TWILIO_SID, password: TWILIO_TOKEN },
     responseType: 'arraybuffer',
     timeout: 30000
   });
@@ -84,86 +82,39 @@ function buildSubject(from, caseId) {
   return caseId ? `${base} [Case #${caseId}]` : base;
 }
 
-// ---------- Twilio send ----------
-async function sendWhatsApp(toWa, body, mediaUrls = []) {
-  if (!TW_SID || !TW_TOKEN || !TW_FROM) {
-    throw new Error('Missing Twilio env (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_WHATSAPP_FROM)');
-  }
-
-  const form = new URLSearchParams();
-  form.append('From', TW_FROM);
-  form.append('To', toWa);
-  if (body) form.append('Body', body);
-  (mediaUrls || []).slice(0, 10).forEach(u => form.append('MediaUrl', u));
-
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${TW_SID}/Messages.json`;
-  const resp = await axios.post(url, form.toString(), {
-    auth: { username: TW_SID, password: TW_TOKEN },
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    timeout: 20000
-  });
-  return resp.data;
-}
-
-// ---------- Kayako helpers for outbound ----------
-async function getRequesterWhatsappFromCase(caseId) {
-  const ky = kayakoClient();
-
-  // 1) Get case to find requester user id
-  const c = await ky.get(`/cases/${caseId}.json`);
-  const requesterId =
-    c.data?.data?.requester?.id ||
-    c.data?.requester?.id ||
-    null;
-  if (!requesterId) return null;
-
-  // 2) List requester identities; find our pseudo email on FROM_DOMAIN
-  const ids = await ky.get(`/users/${requesterId}/identities.json`).catch(() => ({ data: { data: [] } }));
-  const list = ids.data?.data || [];
-  const emailIdentity = list.find(i => {
-    const addr = (i.email || i.address || i.value || '').toLowerCase();
-    return addr.endsWith(`@${FROM_DOMAIN.toLowerCase()}`);
-  });
-  if (!emailIdentity) return null;
-
-  const email = emailIdentity.email || emailIdentity.address || emailIdentity.value;
-  return emailToWhatsappAddress(email);
-}
-
-// ===================================================
-// =============== INBOUND: WhatsApp =================
-// ===================================================
-app.post('/incoming-whatsapp', async (req, res) => {
-  const from     = req.body.From || '';              // "whatsapp:+4479…"
-  const caption  = (req.body.Body || '').trim();     // may be empty if only media
-  const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
-
-  console.log(`📩 WhatsApp from ${from}: ${caption || '(no text)'} — media: ${numMedia}`);
-
-  // Build "From" email used to create/identify the requester
-  const fromEmail = buildFromAddress(from);
-
-  // Optional: try to find an existing open case to include in subject
-  let existingCaseId = null;
+async function findLatestOpenCaseIdByIdentity(email) {
   try {
-    const ky = kayakoClient();
-    const r = await ky.get('/cases.json', {
+    const client = kayakoClient();
+    const r = await client.get('/cases.json', {
       params: {
         identity_type: 'EMAIL',
-        identity_value: fromEmail,
+        identity_value: email,
         status: 'NEW,OPEN,PENDING',
         limit: 1,
         sort: 'updated_at',
         order: 'desc'
       }
     });
-    existingCaseId = r.data?.data?.[0]?.id || null;
-    if (existingCaseId) console.log('🔎 Found open case for identity:', existingCaseId);
+    const id = r.data?.data?.[0]?.id || null;
+    if (id) console.log('🔎 Found open case for identity:', id);
+    return id;
   } catch (e) {
     console.warn('⚠️ Case lookup failed:', e.response?.data || e.message);
+    return null;
   }
+}
 
-  // Collect attachments
+// ---------- WhatsApp -> Kayako (email in) ----------
+app.post('/incoming-whatsapp', async (req, res) => {
+  const from      = req.body.From || '';
+  const caption   = (req.body.Body || '').trim();
+  const numMedia  = parseInt(req.body.NumMedia || '0', 10) || 0;
+
+  console.log(`📩 WhatsApp from ${from}: ${caption || '(no text)'} — media: ${numMedia}`);
+
+  const fromEmail = buildFromAddress(from);
+  const existingCaseId = await findLatestOpenCaseIdByIdentity(fromEmail);
+
   const attachments = [];
   let totalBytes = 0;
 
@@ -175,20 +126,15 @@ app.post('/incoming-whatsapp', async (req, res) => {
     try {
       const buf = await fetchTwilioMedia(url);
       totalBytes += buf.length;
-
-      // Keep below ~22MB raw to stay under SendGrid's ~30MB base64 limit
       if (totalBytes > 22 * 1024 * 1024) {
         console.warn(`⚠️ Skipping media ${i} to keep email size reasonable.`);
         continue;
       }
-
-      const ext      = guessExt(type);
-      const safeNum  = from.replace(/\D/g, '');
+      const ext     = guessExt(type);
+      const safeNum = from.replace(/\D/g, '');
       const filename = `${safeNum}-wa-${i + 1}${ext}`;
-      const b64      = buf.toString('base64');
-
       attachments.push({
-        content: b64,
+        content: buf.toString('base64'),
         filename,
         type,
         disposition: 'attachment'
@@ -198,7 +144,6 @@ app.post('/incoming-whatsapp', async (req, res) => {
     }
   }
 
-  // Ensure SendGrid has at least one char of text
   const bodyText =
     caption ||
     (attachments.length
@@ -206,9 +151,9 @@ app.post('/incoming-whatsapp', async (req, res) => {
       : 'WhatsApp message (no text).');
 
   const msg = {
-    to: SEND_TO,                                   // Kayako mailbox
-    from: { email: fromEmail, name: from },        // pseudo-identity (customer)
-    subject: buildSubject(from, existingCaseId),   // add [Case #123456] if found
+    to: SEND_TO,
+    from: { email: fromEmail, name: from },
+    subject: buildSubject(from, existingCaseId),
     text: bodyText,
     attachments,
     headers: {
@@ -227,40 +172,58 @@ app.post('/incoming-whatsapp', async (req, res) => {
   }
 });
 
-// ===================================================
-// ============== OUTBOUND: Kayako → WA ==============
-// ===================================================
-// Kayako Business Rule should POST JSON like:
-// { "case_id": "{{case.id}}", "contents": "{{post.plain_body}}" }
+// ---------- Kayako -> WhatsApp (reply out) ----------
 app.post('/kayako-outbound', async (req, res) => {
   try {
-    // Basic shared-secret check
-    const provided = req.headers['x-webhook-secret'] || req.headers['x-kayako-signature'] || req.body.secret;
-    if (KY_SECRET && String(provided) !== String(KY_SECRET)) {
-      console.warn('🔐 Webhook secret mismatch');
-      return res.status(403).json({ ok: false, error: 'forbidden' });
+    // Be very tolerant about structures from Kayako Automations
+    const b = req.body || {};
+    const text =
+      b.message || b.contents || b.text || b.plain_body ||
+      b.post?.plain_body || b.post?.body || '';
+
+    const requesterEmail =
+      b.requester_email || b.email || b.from_email ||
+      b.case?.requester?.email || b.requester?.email || '';
+
+    // You can also allow Kayako to pass the number explicitly:
+    const explicitTo =
+      b.to || b.phone || b.whatsapp_to || b.requester_phone || '';
+
+    console.log('🔔 Kayako webhook body:', JSON.stringify(b, null, 2));
+
+    // Basic validation
+    if (!text || !text.trim()) {
+      return res.status(200).json({ ok: false, error: 'bad_payload', why: 'missing_text' });
     }
 
-    const caseId   = req.body.case_id || req.body.case?.id || req.body.id;
-    const contents = (req.body.contents || req.body.message || req.body.body || '').toString().trim();
-
-    if (!caseId || !contents) {
-      return res.status(400).json({ ok: false, error: 'bad_payload' });
+    // Work out the WhatsApp destination
+    let toWhatsApp = '';
+    if (explicitTo && /^(\+?\d+)$/.test(String(explicitTo))) {
+      toWhatsApp = 'whatsapp:' + explicitTo.replace(/^whatsapp:/, '').replace(/^\+?/, '+');
+    } else {
+      const fromPseudo = requesterEmail && extractPhoneFromPseudoEmail(requesterEmail);
+      if (fromPseudo) toWhatsApp = fromPseudo;
     }
 
-    // Who to send to? Look up the requester’s whatsapp pseudo identity
-    const toWa = await getRequesterWhatsappFromCase(caseId);
-    if (!toWa) {
-      console.warn(`⚠️ No WhatsApp identity found for case ${caseId}`);
-      return res.status(404).json({ ok: false, error: 'no_whatsapp_identity' });
+    if (!toWhatsApp) {
+      return res.status(200).json({ ok: false, error: 'bad_payload', why: 'missing_destination' });
+    }
+    if (!TW_WHATSAPP_FROM) {
+      return res.status(500).json({ ok: false, error: 'server_misconfig', why: 'TWILIO_WHATSAPP_FROM missing' });
     }
 
-    await sendWhatsApp(toWa, contents);
-    console.log(`➡️  Sent WhatsApp to ${toWa} from case #${caseId}`);
-    return res.json({ ok: true });
+    // Send via Twilio WhatsApp
+    const resp = await tClient.messages.create({
+      from: TW_WHATSAPP_FROM,
+      to: toWhatsApp,
+      body: text.trim()
+    });
+
+    console.log('➡️  Sent WhatsApp:', { sid: resp.sid, to: toWhatsApp });
+    return res.status(200).json({ ok: true, sid: resp.sid });
   } catch (err) {
     console.error('❌ Outbound error:', err.response?.data || err.message || err);
-    return res.status(500).json({ ok: false, error: 'server_error' });
+    return res.status(500).json({ ok: false, error: 'exception' });
   }
 });
 
