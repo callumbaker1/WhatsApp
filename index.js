@@ -1,6 +1,23 @@
-// index.js — WhatsApp ↔ Kayako bridge (clean replies + attachment relay)
-// Twilio inbound -> SendGrid email to Kayako
-// SendGrid inbound -> Twilio WhatsApp (strip signatures/quotes, host attachments)
+// index.js — WhatsApp ↔ Kayako bridge (clean replies, attachments, delivery status)
+// - Twilio inbound  -> SendGrid email to Kayako (supports media, case reuse via subject token)
+// - SendGrid inbound -> Twilio WhatsApp (strip signatures/quotes, host attachments, status callback)
+//
+// Install:
+//   npm i express body-parser axios dotenv @sendgrid/mail multer twilio
+//
+// Env (Render):
+//   SENDGRID_API_KEY=...                   // SendGrid API key
+//   MAIL_TO=hello@stickershop.co.uk        // Kayako mailbox address
+//   MAIL_FROM_DOMAIN=whatsapp.stickershop.co.uk
+//   TWILIO_ACCOUNT_SID=ACxxxxxxxx
+//   TWILIO_AUTH_TOKEN=xxxxxxxx
+//   TWILIO_WHATSAPP_FROM=whatsapp:+44XXXXXXXXXX
+//   KAYAKO_BASE_URL=https://stickershop.kayako.com
+//   KAYAKO_USERNAME=...                    // for case lookup (subject threading)
+//   KAYAKO_PASSWORD=...
+//   KAYAKO_FROM_ALLOWLIST=hello@stickershop.co.uk
+//   SG_INBOUND_SECRET=optionalSharedSecret // (optional) to protect /sg-inbound
+//   SERVICE_BASE_URL=https://yourapp.onrender.com  // (optional) overrides autodetected base for callbacks/files
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -35,7 +52,7 @@ const FROM_ALLOW   = (process.env.KAYAKO_FROM_ALLOWLIST || 'hello@stickershop.co
   .filter(Boolean);
 
 const INBOUND_SECRET = process.env.SG_INBOUND_SECRET || '';
-const SERVICE_BASE   = process.env.SERVICE_BASE_URL || ''; // optional override (otherwise derived)
+const SERVICE_BASE   = process.env.SERVICE_BASE_URL || ''; // optional override
 
 // SendGrid
 if (!process.env.SENDGRID_API_KEY) console.error('❌ Missing SENDGRID_API_KEY');
@@ -121,19 +138,32 @@ function firstAddress(str = '') {
 }
 
 function toWhatsAppNumber(toField = '', envelope = '') {
-  // Try RCPT TO from SendGrid's envelope first
+  // Prefer RCPT TO from SendGrid envelope, only our subdomain
   try {
     const env = JSON.parse(envelope || '{}');
     const arr = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
-    const to = arr.find(a => String(a).toLowerCase().endsWith(`@${FROM_DOMAIN}`)) || arr[0] || '';
-    const digits = String((to || '').split('@')[0]).replace(/\D/g, '');
-    return digits ? `whatsapp:+${digits}` : null;
+    const to = arr.find(a => String(a).toLowerCase().endsWith(`@${FROM_DOMAIN}`));
+    if (to) {
+      const digits = String(to.split('@')[0]).replace(/\D/g, '');
+      return digits ? `whatsapp:+${digits}` : null;
+    }
   } catch { /* ignore */ }
 
-  // Fallback to the "to" header
+  // Fallback: "to" header but ONLY if it ends with our subdomain
   const addr = firstAddress(toField);
-  const digits = String((addr || '').split('@')[0]).replace(/\D/g, '');
-  return digits ? `whatsapp:+${digits}` : null;
+  if (addr && addr.toLowerCase().endsWith(`@${FROM_DOMAIN}`)) {
+    const digits = addr.split('@')[0].replace(/\D/g, '');
+    return digits ? `whatsapp:+${digits}` : null;
+  }
+  return null;
+}
+
+function deriveBase(req) {
+  if (SERVICE_BASE) return SERVICE_BASE.replace(/\/+$/, '');
+  if (process.env.RENDER_EXTERNAL_URL) return process.env.RENDER_EXTERNAL_URL.replace(/\/+$/, '');
+  const proto = req.headers['x-forwarded-proto'] || 'https';
+  const host  = req.headers['x-forwarded-host'] || req.headers.host;
+  return `${proto}://${host}`;
 }
 
 // ---------- WhatsApp -> Kayako (email via SendGrid) ----------
@@ -197,7 +227,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
   try {
     await sgMail.send(msg);
     console.log(`✉️  Emailed to Kayako as ${msg.from.email} → ${SEND_TO} (attachments: ${attachments.length})`);
-    res.type('text/xml').send('<Response></Response>');
+    res.type('text/xml').send('<Response></Response>'); // Twilio OK
   } catch (e) {
     console.error('❌ Send failed:', e.response?.body || e.message || e);
     res.status(500).send('SendGrid error');
@@ -206,8 +236,8 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
 // ---------- Temporary file hosting for WhatsApp media ----------
 const upload = multer({ storage: multer.memoryStorage() });
-const FILE_TTL_MS = 20 * 60 * 1000; // 20 minutes
-const MAX_MEDIA_BYTES = 10 * 1024 * 1024; // per file safeguard (10MB)
+const FILE_TTL_MS = 20 * 60 * 1000;      // 20 minutes
+const MAX_MEDIA_BYTES = 10 * 1024 * 1024; // 10MB per attachment (Twilio limits)
 const memStore = new Map(); // id -> {buf,type,name,exp}
 
 setInterval(() => {
@@ -215,12 +245,11 @@ setInterval(() => {
   for (const [id, v] of memStore) if (v.exp < now) memStore.delete(id);
 }, 60 * 1000);
 
-function storeTempFile(buffer, type, name) {
+function storeTempFile(req, buffer, type, name) {
   const id = crypto.randomBytes(16).toString('hex');
   memStore.set(id, { buf: buffer, type: type || 'application/octet-stream', name: name || 'file', exp: Date.now() + FILE_TTL_MS });
-  const base = SERVICE_BASE || process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '';
-  const origin = base || ''; // If unset, rely on the public Render URL populated at runtime
-  return `${origin}${origin.endsWith('/') ? '' : ''}/file/${id}`;
+  const origin = deriveBase(req);
+  return `${origin}/file/${id}`;
 }
 
 app.get('/file/:id', (req, res) => {
@@ -231,7 +260,7 @@ app.get('/file/:id', (req, res) => {
   res.send(v.buf);
 });
 
-// ---------- Email cleaning ----------
+// ---------- Email body cleaning ----------
 function stripQuotedAndSignature(txt) {
   if (!txt) return '';
   let s = String(txt).replace(/\r\n/g, '\n');
@@ -264,7 +293,7 @@ function stripQuotedAndSignature(txt) {
   // strip stray [img ...] blocks
   s = s.replace(/\[img[\s\S]*?\]/gi, ' ');
 
-  // (optional) company-specific nuke
+  // company-specific nukes (adjust as needed)
   const killPhrases = [
     /stickershop is a trading division/i,
     /theprintshop ltd/i
@@ -305,25 +334,24 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
       return res.status(200).send('no-to');
     }
 
-    // Clean body
+    // Clean text
     let body = (text || '').trim();
     if (!body && html) {
-      // very basic HTML strip
-      body = String(html).replace(/<style[\s\S]*?<\/style>/gi, ' ')
-                         .replace(/<[^>]+>/g, ' ')
-                         .replace(/&nbsp;/gi, ' ')
-                         .replace(/\s+/g, ' ')
-                         .trim();
+      body = String(html)
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
     }
     body = stripQuotedAndSignature(body);
     if (!body) body = '(no text)';
 
-    // Decide which attachments to forward (ignore inline signature images)
+    // Forward non-inline attachments (host temporarily)
     const mediaUrls = [];
     let info = {};
     try { info = JSON.parse(req.body['attachment-info'] || '{}'); } catch {}
 
-    // Map filename -> meta to decide inline vs attachment
     const inlineNames = new Set(
       Object.values(info)
         .filter(meta => /inline/i.test(meta.disposition || '') || meta['content-id'])
@@ -332,20 +360,17 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
 
     for (const f of req.files || []) {
       const name = (f.originalname || 'file').toLowerCase();
-      if (inlineNames.has(name)) {
-        // Skip inline/logo
-        continue;
-      }
-      if (f.size > MAX_MEDIA_BYTES) {
+      if (inlineNames.has(name)) continue;                 // skip signature/logos
+      if (f.size > MAX_MEDIA_BYTES) {                      // size guard
         console.warn('⚠️ Skipping large attachment:', name, f.size);
         continue;
       }
-      const url = storeTempFile(f.buffer, f.mimetype, f.originalname);
+      const url = storeTempFile(req, f.buffer, f.mimetype, f.originalname);
       mediaUrls.push(url);
-      if (mediaUrls.length >= 10) break; // Twilio limit
+      if (mediaUrls.length >= 10) break;                   // Twilio limit
     }
 
-    // Validate channels before sending
+    // Validate channels
     if (!/^whatsapp:\+\d{6,16}$/.test(WA_FROM)) {
       console.error('❌ TWILIO_WHATSAPP_FROM invalid:', WA_FROM);
       return res.status(500).send('bad-from');
@@ -357,7 +382,9 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
 
     console.log('➡️  Twilio send\n    FROM:', WA_FROM, '\n    TO  :', waTo, '\n    BODY:', body.slice(0, 160), '\n    media:', mediaUrls.length);
 
-    const payload = { from: WA_FROM, to: waTo, body };
+    const statusCallback = deriveBase(req) + '/twilio-status';
+
+    const payload = { from: WA_FROM, to: waTo, body, statusCallback };
     if (mediaUrls.length) payload.mediaUrl = mediaUrls;
 
     const msg = await tClient.messages.create(payload);
@@ -368,6 +395,18 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
     console.error('❌ /sg-inbound error:', err.response?.data || err.message || err);
     return res.status(500).send('error');
   }
+});
+
+// ---------- Twilio delivery status webhook ----------
+app.post('/twilio-status', express.urlencoded({ extended: false }), (req, res) => {
+  // MessageStatus: queued|accepted|sent|delivered|read|undelivered|failed
+  console.log('📬 Twilio status:',
+    'sid=', req.body.MessageSid,
+    'status=', req.body.MessageStatus,
+    'error=', req.body.ErrorCode || '',
+    req.body.ErrorMessage || ''
+  );
+  res.sendStatus(200);
 });
 
 // ---------- Health ----------
