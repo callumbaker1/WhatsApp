@@ -234,37 +234,50 @@ app.get('/file/:id', (req, res) => {
 // ---------- Email cleaning ----------
 function stripQuotedAndSignature(txt) {
   if (!txt) return '';
+  // normalise line breaks
+  let s = String(txt).replace(/\r\n/g, '\n');
 
-  let s = txt.replace(/\r\n/g, '\n');
+  // 1) remove quoted history lines starting with ">"
+  s = s.split('\n').filter(l => !/^\s*>/.test(l)).join('\n');
 
-  // Remove lines starting with ">" (quoted)
-  s = s.split('\n').filter(line => !/^\s*>/.test(line)).join('\n');
+  // 2) stop at Gmail-style "On … wrote:"
+  const wroteIdx = s.search(/^\s*On .+ wrote:\s*$/im);
+  if (wroteIdx !== -1) s = s.slice(0, wroteIdx);
 
-  // Cut at the Gmail style "On … wrote:" line
-  s = s.split('\n').reduce((acc, line) => {
-    if (/^On .+ wrote:$/i.test(line.trim())) return acc; // stop collecting
-    if (acc !== null) return acc + line + '\n';
-    return acc;
-  }, '');
-
-  // If above reducer stopped early it would return string, else null; ensure string
-  if (s == null) s = txt;
-
-  // Cut at classic signature delimiter: "-- " on its own line
-  const sigIdx = s.indexOf('\n-- \n');
-  if (sigIdx !== -1) s = s.slice(0, sigIdx);
-
-  // Chop common Outlook reply header block
-  const hdrIdx = s.search(/\nFrom:\s|^\s*From:\s/im);
+  // 3) stop at Outlook-style reply header block (From/Sent/To/Subject)
+  const hdrIdx = s.search(/^\s*(From|Sent|To|Subject):\s/im);
   if (hdrIdx !== -1) s = s.slice(0, hdrIdx);
 
-  // Remove any [img ...] blocks that sometimes appear
+  // 4) signature separators: a line of dashes/underscores/long dashes
+  const sepMatch = s.match(/^[\t ]*[–—-=_]{10,}[\t ]*$/m);
+  if (sepMatch) s = s.slice(0, sepMatch.index);
+
+  // 5) contact-block “fields” like: t. / m. / e. / w.
+  const fieldsMatch = s.match(/^\s*(?:t\.|m\.|e\.|w\.)\s+/im);
+  if (fieldsMatch) s = s.slice(0, fieldsMatch.index);
+
+  // 6) legal/disclaimer phrases
+  const legalIdx = s.search(
+    /(registered address|company\s*(no|number)|confidential(ity)? notice|this message (is|may be) confidential|please consider the environment)/i
+  );
+  if (legalIdx !== -1) s = s.slice(0, legalIdx);
+
+  // 7) remove any leftover [img ...] blocks that sometimes appear
   s = s.replace(/\[img[\s\S]*?\]/gi, ' ');
 
-  // Collapse whitespace and limit length for WhatsApp
+  // company-specific phrases you always want removed
+const killPhrases = [
+  /stickershop is a trading division/i,
+  /theprintshop ltd/i
+];
+for (const rx of killPhrases) {
+  const i = s.search(rx);
+  if (i !== -1) { s = s.slice(0, i); break; }
+}
+
+  // tidy whitespace & length
   s = s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   if (s.length > 1600) s = s.slice(0, 1590) + '…';
-
   return s;
 }
 
