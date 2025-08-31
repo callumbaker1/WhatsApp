@@ -25,7 +25,7 @@ const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM || '';
 
 const KAYAKO_BASE  = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
-const KAYAKO_API   = ${KAYAKO_BASE}/api/v1;
+const KAYAKO_API   = `${KAYAKO_BASE}/api/v1`;
 const KAYAKO_USER  = process.env.KAYAKO_USERNAME || '';
 const KAYAKO_PASS  = process.env.KAYAKO_PASSWORD || '';
 
@@ -60,7 +60,7 @@ function kayakoClientOptional() {
 
 function buildFromAddress(phone) {
   const num = String(phone || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
-  return ${num}@${FROM_DOMAIN};
+  return `${num}@${FROM_DOMAIN}`;
 }
 
 function guessExt(contentType = '') {
@@ -88,7 +88,7 @@ async function fetchTwilioMedia(url) {
 }
 
 function buildSubjectBase(from) {
-  return WhatsApp message from ${from};
+  return `WhatsApp message from ${from}`;
 }
 
 async function findLatestOpenCaseIdByIdentity(email) {
@@ -125,15 +125,15 @@ function toWhatsAppNumber(toField = '', envelope = '') {
   try {
     const env = JSON.parse(envelope || '{}');
     const arr = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
-    const to = arr.find(a => String(a).toLowerCase().endsWith(@${FROM_DOMAIN})) || arr[0] || '';
+    const to = arr.find(a => String(a).toLowerCase().endsWith(`@${FROM_DOMAIN}`)) || arr[0] || '';
     const digits = String((to || '').split('@')[0]).replace(/\D/g, '');
-    return digits ? whatsapp:+${digits} : null;
+    return digits ? `whatsapp:+${digits}` : null;
   } catch { /* ignore */ }
 
   // Fallback to the "to" header
   const addr = firstAddress(toField);
   const digits = String((addr || '').split('@')[0]).replace(/\D/g, '');
-  return digits ? whatsapp:+${digits} : null;
+  return digits ? `whatsapp:+${digits}` : null;
 }
 
 // ---------- WhatsApp -> Kayako (email via SendGrid) ----------
@@ -142,7 +142,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
   const caption = (req.body.Body || '').trim();
   const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
 
-  console.log(📩 WhatsApp from ${from}: ${caption || '(no text)'} — media: ${numMedia});
+  console.log(`📩 WhatsApp from ${from}: ${caption || '(no text)'} — media: ${numMedia}`);
 
   const fromEmail = buildFromAddress(from);
   const existingCaseId = await findLatestOpenCaseIdByIdentity(fromEmail);
@@ -151,8 +151,8 @@ app.post('/incoming-whatsapp', async (req, res) => {
   let totalBytes = 0;
 
   for (let i = 0; i < numMedia; i++) {
-    const url  = req.body[MediaUrl${i}];
-    const type = req.body[MediaContentType${i}] || 'application/octet-stream';
+    const url  = req.body[`MediaUrl${i}`];
+    const type = req.body[`MediaContentType${i}`] || 'application/octet-stream';
     if (!url) continue;
 
     try {
@@ -160,29 +160,29 @@ app.post('/incoming-whatsapp', async (req, res) => {
       totalBytes += buf.length;
 
       if (totalBytes > 22 * 1024 * 1024) {
-        console.warn(⚠️ Skipping media ${i} to stay under email limit);
+        console.warn(`⚠️ Skipping media ${i} to stay under email limit`);
         continue;
       }
 
       const ext      = guessExt(type);
       const safeNum  = from.replace(/\D/g, '');
-      const filename = ${safeNum}-wa-${i + 1}${ext};
+      const filename = `${safeNum}-wa-${i + 1}${ext}`;
       const b64      = buf.toString('base64');
 
       attachments.push({ content: b64, filename, type, disposition: 'attachment' });
     } catch (err) {
-      console.error(❌ Failed to fetch media ${i}:, err.response?.status || err.message);
+      console.error(`❌ Failed to fetch media ${i}:`, err.response?.status || err.message);
     }
   }
 
   const bodyText =
     caption ||
     (attachments.length
-      ? WhatsApp message from ${from} with ${attachments.length} attachment(s).
+      ? `WhatsApp message from ${from} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
   const subject = existingCaseId
-    ? ${buildSubjectBase(from)} [Case #${existingCaseId}]
+    ? `${buildSubjectBase(from)} [Case #${existingCaseId}]`
     : buildSubjectBase(from);
 
   const msg = {
@@ -196,7 +196,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   try {
     await sgMail.send(msg);
-    console.log(✉️  Emailed to Kayako as ${msg.from.email} → ${SEND_TO} (attachments: ${attachments.length}));
+    console.log(`✉️  Emailed to Kayako as ${msg.from.email} → ${SEND_TO} (attachments: ${attachments.length})`);
     res.type('text/xml').send('<Response></Response>');
   } catch (e) {
     console.error('❌ Send failed:', e.response?.body || e.message || e);
@@ -220,14 +220,14 @@ function storeTempFile(buffer, type, name) {
   memStore.set(id, { buf: buffer, type: type || 'application/octet-stream', name: name || 'file', exp: Date.now() + FILE_TTL_MS });
   const base = SERVICE_BASE || process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '';
   const origin = base || ''; // If unset, rely on the public Render URL populated at runtime
-  return ${origin}${origin.endsWith('/') ? '' : ''}/file/${id};
+  return `${origin}${origin.endsWith('/') ? '' : ''}/file/${id}`;
 }
 
 app.get('/file/:id', (req, res) => {
   const v = memStore.get(req.params.id);
   if (!v) return res.status(404).send('not found');
   res.setHeader('Content-Type', v.type);
-  res.setHeader('Content-Disposition', inline; filename="${v.name}");
+  res.setHeader('Content-Disposition', `inline; filename="${v.name}"`);
   res.send(v.buf);
 });
 
@@ -374,4 +374,4 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
 app.get('/', (_req, res) => res.send('Webhook is running ✅'));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(🚀 Webhook server running on port ${PORT}));
+app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
