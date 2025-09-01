@@ -89,7 +89,7 @@ async function fetchTwilioMedia(url) {
 }
 
 function buildSubjectBase(from) {
-  return `WhatsApp message from ${from}`;
+  return `New message from ${from}`;
 }
 
 async function findLatestOpenCaseIdByIdentity(email) {
