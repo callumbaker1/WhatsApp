@@ -1,4 +1,6 @@
-// index.js — WhatsApp ↔ Kayako bridge (thread-safe via RFC headers + subject token)
+// index.js — WhatsApp ↔ Kayako bridge (anchor case + clean replies + attachment relay)
+// Twilio inbound  -> SendGrid email to Kayako (threads from msg #1 using anchor case)
+// SendGrid inbound -> Twilio WhatsApp (strip signatures/quotes, host attachments)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -8,7 +10,7 @@ const sgMail = require('@sendgrid/mail');
 const multer = require('multer');
 const twilio = require('twilio');
 const crypto = require('crypto');
-const fs = require('fs');
+const fs = require('fs/promises');
 const path = require('path');
 
 dotenv.config();
@@ -18,11 +20,11 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 // ---------- Config ----------
-const SEND_TO      = process.env.MAIL_TO;
+const SEND_TO      = process.env.MAIL_TO;                                   // e.g. hello@stickershop.co.uk
 const FROM_DOMAIN  = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
 const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM || '';
+const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM || '';               // e.g. "whatsapp:+44XXXXXXXXXX"
 
 const KAYAKO_BASE  = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
 const KAYAKO_API   = `${KAYAKO_BASE}/api/v1`;
@@ -35,8 +37,10 @@ const FROM_ALLOW   = (process.env.KAYAKO_FROM_ALLOWLIST || 'hello@stickershop.co
   .filter(Boolean);
 
 const INBOUND_SECRET = process.env.SG_INBOUND_SECRET || '';
-const SERVICE_BASE   = process.env.SERVICE_BASE_URL || ''; // optional override
-const MAP_PATH       = process.env.MAP_PATH || '/data/phone_case_map.json'; // persistent map
+const SERVICE_BASE   = process.env.SERVICE_BASE_URL || '';  // optional, else Render URL is used
+
+// Persisted phone → case/message map (survives deploys if on disk)
+const MAP_PATH      = process.env.MAP_PATH || '/data/phone_case_map.json';
 
 // SendGrid
 if (!process.env.SENDGRID_API_KEY) console.error('❌ Missing SENDGRID_API_KEY');
@@ -48,35 +52,46 @@ if (!/^whatsapp:\+\d{6,16}$/.test(WA_FROM || '')) {
   console.error('❌ TWILIO_WHATSAPP_FROM must look like "whatsapp:+4479…". Current:', WA_FROM);
 }
 
-// ---------- Persistent phone ➜ {caseId,lastMessageId} map ----------
+// ---------- Simple persistent map (phone -> { caseId, lastMessageId, ... }) ----------
 let phoneMap = {};
-try {
-  if (fs.existsSync(MAP_PATH)) {
-    phoneMap = JSON.parse(fs.readFileSync(MAP_PATH, 'utf8'));
-    console.log('📇 Map loaded:', MAP_PATH);
-  }
-} catch (e) { console.warn('⚠️ Could not load map:', e.message); }
 
-let saveTimer = null;
-function saveMapSoon() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
+async function initMap() {
+  try {
+    const dir = path.dirname(MAP_PATH);
+    await fs.mkdir(dir, { recursive: true });
     try {
-      fs.mkdirSync(path.dirname(MAP_PATH), { recursive: true });
-      fs.writeFileSync(MAP_PATH, JSON.stringify(phoneMap, null, 2));
-      // console.log('📇 Map saved:', MAP_PATH);
-    } catch (e) { console.warn('⚠️ Could not save map:', e.message); }
-  }, 200);
-}
-async function mapGet(key) { return phoneMap[key] || null; }
-async function mapSet(key, patch) {
-  const cur = phoneMap[key] || {};
-  phoneMap[key] = { ...cur, ...patch };
-  saveMapSoon();
-  return phoneMap[key];
+      const buf = await fs.readFile(MAP_PATH);
+      phoneMap = JSON.parse(String(buf) || '{}');
+    } catch (e) {
+      if (e.code !== 'ENOENT') throw e;
+      phoneMap = {};
+      await fs.writeFile(MAP_PATH, JSON.stringify(phoneMap, null, 2));
+    }
+    console.log('📒 Map loaded:', MAP_PATH);
+  } catch (e) {
+    console.error('❌ Map init failed:', e.message);
+  }
 }
 
-// ---------- Helpers ----------
+async function saveMap() {
+  try {
+    await fs.writeFile(MAP_PATH, JSON.stringify(phoneMap, null, 2));
+  } catch (e) {
+    console.error('❌ Map save failed:', e.message);
+  }
+}
+
+async function mapGet(waPhone) {
+  return phoneMap[waPhone] || null;
+}
+
+async function mapSet(waPhone, patch) {
+  const cur = phoneMap[waPhone] || {};
+  phoneMap[waPhone] = { ...cur, ...patch, updatedAt: Date.now() };
+  await saveMap();
+}
+
+// ---------- Kayako helpers ----------
 function kayakoClientOptional() {
   if (!KAYAKO_USER || !KAYAKO_PASS) return null;
   return axios.create({
@@ -87,9 +102,89 @@ function kayakoClientOptional() {
   });
 }
 
+async function findLatestOpenCaseIdByIdentity(email) {
+  try {
+    const client = kayakoClientOptional();
+    if (!client) return null;
+
+    const r = await client.get('/cases.json', {
+      params: {
+        identity_type: 'EMAIL',
+        identity_value: email,
+        status: 'NEW,OPEN,PENDING',
+        limit: 1,
+        sort: 'updated_at',
+        order: 'desc'
+      }
+    });
+    const id = r.data?.data?.[0]?.id || null;
+    if (id) console.log('🔎 Found open case for identity:', id);
+    return id;
+  } catch (e) {
+    console.warn('⚠️ Case lookup failed:', e.response?.data || e.message);
+    return null;
+  }
+}
+
+async function findOrCreateUserByEmail(client, email, name) {
+  try {
+    const sr = await client.get('/search.json', { params: { query: email, resources: 'users' } });
+    const hits = sr.data?.data || [];
+    const match = hits.find(u => u.resource === 'user' && (u.snippet === email || u.email === email));
+    if (match) return match.id;
+  } catch (_) {}
+
+  const cr = await client.post('/users.json', {
+    full_name: name || email,
+    role_id: 4,   // customer
+    email
+  });
+  return cr.data?.data?.id || cr.data?.id;
+}
+
+async function createAnchorCase(client, requester_id, waFrom) {
+  // Create a case with a private note so it exists to thread against
+  const resp = await client.post('/cases.json', {
+    subject: `WhatsApp chat with ${waFrom}`,
+    requester_id,
+    channel: 'NOTE',                         // private anchor
+    contents: 'Anchor created by WhatsApp bridge'
+  });
+  return resp.data?.data?.id || resp.data?.id;
+}
+
+/** Ensure we have a caseId for this WA number before sending the first email. */
+async function ensureCaseIdForPhone(waFrom, fromEmail) {
+  const existingRow = await mapGet(waFrom);
+  if (existingRow?.caseId) return existingRow.caseId;
+
+  const client = kayakoClientOptional();
+  if (!client) return null; // if no Kayako creds, can't pre-thread
+
+  // Try to reuse an existing open case for this identity
+  const reuse = await findLatestOpenCaseIdByIdentity(fromEmail);
+  if (reuse) {
+    await mapSet(waFrom, { caseId: reuse });
+    return reuse;
+  }
+
+  // Otherwise create an anchor case now
+  const requesterId = await findOrCreateUserByEmail(client, fromEmail, waFrom);
+  const caseId = await createAnchorCase(client, requesterId, waFrom);
+  await mapSet(waFrom, { caseId });
+  console.log('🧷 Anchor case created:', caseId, 'for', waFrom);
+  return caseId;
+}
+
+// ---------- Common helpers ----------
 function buildFromAddress(phone) {
+  // "whatsapp:+4479..." → "4479...@whatsapp.stickershop.co.uk"
   const num = String(phone || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
   return `${num}@${FROM_DOMAIN}`;
+}
+
+function buildSubjectBase(from) {
+  return `WhatsApp message from ${from}`;
 }
 
 function guessExt(contentType = '') {
@@ -116,42 +211,13 @@ async function fetchTwilioMedia(url) {
   return Buffer.from(resp.data);
 }
 
-function buildSubjectBase(from) {
-  return `WhatsApp message from ${from}`;
-}
-
-// optional seed (first time only)
-async function findLatestOpenCaseIdByIdentity(email) {
-  try {
-    const client = kayakoClientOptional();
-    if (!client) return null;
-
-    const r = await client.get('/cases.json', {
-      params: {
-        identity_type: 'EMAIL',
-        identity_value: email,
-        status: 'NEW,OPEN,PENDING',
-        limit: 1,
-        sort: 'updated_at',
-        order: 'desc'
-      }
-    });
-    const id = r.data?.data?.[0]?.id || null;
-    if (id) console.log('🔎 Found open case for identity:', id);
-    return id;
-  } catch (e) {
-    console.warn('⚠️ Case lookup failed:', e.response?.data || e.message);
-    return null;
-  }
-}
-
 function firstAddress(str = '') {
   const m = String(str).match(/<?([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>?/i);
   return m ? m[1].toLowerCase() : '';
 }
 
 function toWhatsAppNumber(toField = '', envelope = '') {
-  // Try RCPT TO from SendGrid's envelope first
+  // Prefer RCPT TO from SendGrid's envelope
   try {
     const env = JSON.parse(envelope || '{}');
     const arr = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
@@ -160,39 +226,33 @@ function toWhatsAppNumber(toField = '', envelope = '') {
     return digits ? `whatsapp:+${digits}` : null;
   } catch { /* ignore */ }
 
-  // Fallback to the "to" header
+  // Fallback: parse "to" header
   const addr = firstAddress(toField);
   const digits = String((addr || '').split('@')[0]).replace(/\D/g, '');
   return digits ? `whatsapp:+${digits}` : null;
 }
 
-function extractMessageId(headersStr = '') {
-  const m = String(headersStr).match(/^message-id:\s*<([^>]+)>/im);
-  return m ? `<${m[1]}>` : null; // keep angle brackets
-}
-
 // ---------- WhatsApp -> Kayako (email via SendGrid) ----------
 app.post('/incoming-whatsapp', async (req, res) => {
-  const waFrom = req.body.From || '';            // "whatsapp:+4479…"
-  const caption = (req.body.Body || '').trim();
+  const waFrom = req.body.From || '';                 // "whatsapp:+4479…"
+  const caption = (req.body.Body || '').trim();       // may be empty if only media
   const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
 
   console.log(`📩 WhatsApp from ${waFrom}: ${caption || '(no text)'} — media: ${numMedia}`);
 
+  // Pseudo-email identity (for Kayako identity matching)
   const fromEmail = buildFromAddress(waFrom);
 
-  // look up per-number mapping
-  let mapRow = await mapGet(waFrom);
+  // Ensure a case exists to thread against from the very first message
+  await ensureCaseIdForPhone(waFrom, fromEmail);
 
-  // optional: if we have no caseId yet, seed from Kayako (first time only)
-  if (!mapRow?.caseId) {
-    const seedId = await findLatestOpenCaseIdByIdentity(fromEmail);
-    if (seedId) mapRow = await mapSet(waFrom, { caseId: seedId });
-  }
+  // Reload mapping (should have caseId now)
+  const mapRow = await mapGet(waFrom);
 
   // Collect media
   const attachments = [];
   let totalBytes = 0;
+
   for (let i = 0; i < numMedia; i++) {
     const url  = req.body[`MediaUrl${i}`];
     const type = req.body[`MediaContentType${i}`] || 'application/octet-stream';
@@ -201,19 +261,19 @@ app.post('/incoming-whatsapp', async (req, res) => {
     try {
       const buf = await fetchTwilioMedia(url);
       totalBytes += buf.length;
+
+      // Keep under ~22MB raw (base64 ≈ 30MB SendGrid cap)
       if (totalBytes > 22 * 1024 * 1024) {
         console.warn(`⚠️ Skipping media ${i} to stay under email limit`);
         continue;
       }
+
       const ext      = guessExt(type);
       const safeNum  = waFrom.replace(/\D/g, '');
       const filename = `${safeNum}-wa-${i + 1}${ext}`;
-      attachments.push({
-        content: buf.toString('base64'),
-        filename,
-        type,
-        disposition: 'attachment'
-      });
+      const b64      = buf.toString('base64');
+
+      attachments.push({ content: b64, filename, type, disposition: 'attachment' });
     } catch (err) {
       console.error(`❌ Failed to fetch media ${i}:`, err.response?.status || err.message);
     }
@@ -225,7 +285,6 @@ app.post('/incoming-whatsapp', async (req, res) => {
       ? `WhatsApp message from ${waFrom} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
-  // Build subject + RFC headers for threading
   const subject = mapRow?.caseId
     ? `${buildSubjectBase(waFrom)} [Case #${mapRow.caseId}]`
     : buildSubjectBase(waFrom);
@@ -251,17 +310,17 @@ app.post('/incoming-whatsapp', async (req, res) => {
   try {
     await sgMail.send(msg);
     console.log(`✉️  Emailed to Kayako as ${msg.from.email} → ${SEND_TO} (attachments: ${attachments.length})`);
-    res.type('text/xml').send('<Response></Response>');
+    res.type('text/xml').send('<Response></Response>');  // Twilio OK
   } catch (e) {
     console.error('❌ Send failed:', e.response?.body || e.message || e);
     res.status(500).send('SendGrid error');
   }
 });
 
-// ---------- Temporary file hosting for WhatsApp media (Kayako → WA) ----------
+// ---------- Temporary file hosting for WhatsApp media ----------
 const upload = multer({ storage: multer.memoryStorage() });
-const FILE_TTL_MS = 20 * 60 * 1000; // 20 mins
-const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
+const FILE_TTL_MS = 20 * 60 * 1000; // 20 minutes
+const MAX_MEDIA_BYTES = 10 * 1024 * 1024; // per file (Twilio limit-ish)
 const memStore = new Map(); // id -> {buf,type,name,exp}
 
 setInterval(() => {
@@ -272,8 +331,9 @@ setInterval(() => {
 function storeTempFile(buffer, type, name) {
   const id = crypto.randomBytes(16).toString('hex');
   memStore.set(id, { buf: buffer, type: type || 'application/octet-stream', name: name || 'file', exp: Date.now() + FILE_TTL_MS });
-  const base = SERVICE_BASE || process.env.RENDER_EXTERNAL_URL || '';
-  return `${base}${base.endsWith('/') ? '' : ''}/file/${id}`;
+  const base = SERVICE_BASE || process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '';
+  const origin = base || '';
+  return `${origin}${origin.endsWith('/') ? '' : ''}/file/${id}`;
 }
 
 app.get('/file/:id', (req, res) => {
@@ -284,41 +344,44 @@ app.get('/file/:id', (req, res) => {
   res.send(v.buf);
 });
 
-// ---------- Email body cleaning ----------
+// ---------- Email cleaning ----------
 function stripQuotedAndSignature(txt) {
   if (!txt) return '';
   let s = String(txt).replace(/\r\n/g, '\n');
 
-  // remove quoted '>'
+  // remove quoted history ('>' lines)
   s = s.split('\n').filter(l => !/^\s*>/.test(l)).join('\n');
 
-  // "On … wrote:"
+  // cut at “On … wrote:”
   const wroteIdx = s.search(/^\s*On .+ wrote:\s*$/im);
   if (wroteIdx !== -1) s = s.slice(0, wroteIdx);
 
-  // header-ish blocks
+  // cut at From/Sent/To/Subject header block
   const hdrIdx = s.search(/^\s*(From|Sent|To|Subject):\s/im);
   if (hdrIdx !== -1) s = s.slice(0, hdrIdx);
 
-  // long separator lines (10+ of -, =, _, en dash, em dash)
+  // separator lines (10+ of -, =, _, en dash, em dash)
   const sepMatch = s.match(/^[\t ]*(?:[-=–—_]){10,}[\t ]*$/m);
   if (sepMatch) s = s.slice(0, sepMatch.index);
 
-  // business-card lines (t./m./e./w.)
+  // phone/email/web fields like: t. / m. / e. / w.
   const fieldsMatch = s.match(/^\s*(?:t\.|m\.|e\.|w\.)\s+/im);
   if (fieldsMatch) s = s.slice(0, fieldsMatch.index);
 
-  // legal boilerplate
+  // legal/disclaimer phrases
   const legalIdx = s.search(
     /(registered address|company\s*(no|number)|confidential(ity)? notice|this message (is|may be) confidential|please consider the environment)/i
   );
   if (legalIdx !== -1) s = s.slice(0, legalIdx);
 
-  // stray [img ...]
+  // strip stray [img ...] blocks
   s = s.replace(/\[img[\s\S]*?\]/gi, ' ');
 
-  // company-specific nukes
-  const killPhrases = [/stickershop is a trading division/i, /theprintshop ltd/i];
+  // company-specific footer nukes (adjust as needed)
+  const killPhrases = [
+    /stickershop is a trading division/i,
+    /theprintshop ltd/i
+  ];
   for (const rx of killPhrases) {
     const i = s.search(rx);
     if (i !== -1) { s = s.slice(0, i); break; }
@@ -327,6 +390,12 @@ function stripQuotedAndSignature(txt) {
   s = s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
   if (s.length > 1600) s = s.slice(0, 1590) + '…';
   return s;
+}
+
+function headerLookup(rawHeaders = '', name = 'Message-Id') {
+  const rx = new RegExp(`^\\s*${name}:\\s*<([^>]+)>\\s*$`, 'im');
+  const m = String(rawHeaders || '').match(rx);
+  return m ? `<${m[1]}>` : '';
 }
 
 // ---------- SendGrid Inbound Parse -> WhatsApp ----------
@@ -340,7 +409,7 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
       }
     }
 
-    const { from, to, envelope, subject, headers: rawHeaders } = req.body || {};
+    const { from, to, envelope, subject, headers } = req.body || {};
     let { text, html } = req.body || {};
 
     const fromAddr = firstAddress(from);
@@ -355,48 +424,44 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
       return res.status(200).send('no-to');
     }
 
-    // capture Case # and Message-ID for threading on next inbound email
-    const caseIdMatch = (subject || '').match(/\[Case\s*#(\d+)\]/i);
-    const caseId = caseIdMatch ? caseIdMatch[1] : null;
-    const messageId = extractMessageId(rawHeaders || '');
-
-    let row = await mapGet(waTo);
-    row = await mapSet(waTo, {
-      caseId: caseId || row?.caseId || null,
-      lastMessageId: messageId || row?.lastMessageId || null
-    });
-
-    // build clean body
+    // Clean body
     let body = (text || '').trim();
     if (!body && html) {
-      body = String(html)
-        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/gi, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+      // very basic HTML strip
+      body = String(html).replace(/<style[\s\S]*?<\/style>/gi, ' ')
+                         .replace(/<[^>]+>/g, ' ')
+                         .replace(/&nbsp;/gi, ' ')
+                         .replace(/\s+/g, ' ')
+                         .trim();
     }
     body = stripQuotedAndSignature(body);
     if (!body) body = '(no text)';
 
-    // choose attachments to forward (skip inline)
+    // Decide which attachments to forward (ignore inline signature images)
     const mediaUrls = [];
     let info = {};
     try { info = JSON.parse(req.body['attachment-info'] || '{}'); } catch {}
+
+    // Map filename -> meta to decide inline vs attachment
     const inlineNames = new Set(
       Object.values(info)
         .filter(meta => /inline/i.test(meta.disposition || '') || meta['content-id'])
         .map(meta => (meta.filename || '').toLowerCase())
     );
+
     for (const f of req.files || []) {
       const name = (f.originalname || 'file').toLowerCase();
-      if (inlineNames.has(name)) continue;
-      if (f.size > MAX_MEDIA_BYTES) { console.warn('⚠️ Skipping large attachment:', name, f.size); continue; }
+      if (inlineNames.has(name)) continue; // skip logos
+      if (f.size > MAX_MEDIA_BYTES) {
+        console.warn('⚠️ Skipping large attachment:', name, f.size);
+        continue;
+      }
       const url = storeTempFile(f.buffer, f.mimetype, f.originalname);
       mediaUrls.push(url);
       if (mediaUrls.length >= 10) break; // Twilio limit
     }
 
+    // Validate WhatsApp channels
     if (!/^whatsapp:\+\d{6,16}$/.test(WA_FROM)) {
       console.error('❌ TWILIO_WHATSAPP_FROM invalid:', WA_FROM);
       return res.status(500).send('bad-from');
@@ -414,6 +479,21 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
     const msg = await tClient.messages.create(payload);
     console.log('✅ Relayed to WhatsApp SID:', msg.sid, 'Subject:', subject || '(no subject)');
 
+    // --- Update the map with CaseID (from subject) and last Message-ID for threading ---
+    const caseMatch = String(subject || '').match(/\[Case\s*#(\d+)\]/i);
+    const lastMsgId =
+      req.body['Message-Id'] ||
+      req.body['message-id'] ||
+      headerLookup(headers || '', 'Message-Id') ||
+      '';
+
+    const patch = {};
+    if (caseMatch) patch.caseId = caseMatch[1];
+    if (lastMsgId) patch.lastMessageId = lastMsgId;
+    if (Object.keys(patch).length) {
+      await mapSet(waTo, patch);
+    }
+
     return res.status(200).send('ok');
   } catch (err) {
     console.error('❌ /sg-inbound error:', err.response?.data || err.message || err);
@@ -424,5 +504,8 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
 // ---------- Health ----------
 app.get('/', (_req, res) => res.send('Webhook is running ✅'));
 
+// Start
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
+initMap().then(() => {
+  app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
+});
