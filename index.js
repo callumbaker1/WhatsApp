@@ -220,7 +220,9 @@ app.post('/incoming-whatsapp', async (req, res) => {
       ? `WhatsApp message from ${fromUser} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
-  const subject = buildSubjectBase(fromUser);
+  const subject = existingCaseId
+    ? `${buildSubjectBase(fromUser)} [Case #${existingCaseId}]`
+    : buildSubjectBase(fromUser);
 
   const msg = {
     to: SEND_TO,
