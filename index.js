@@ -1,7 +1,4 @@
-// index.js — WhatsApp ↔ Kayako bridge with robust threading
-// - Twilio inbound  -> SendGrid email to Kayako (supports media, adds In-Reply-To)
-// - SendGrid inbound -> Twilio WhatsApp (cleans body, relays attachments)
-// - Persists phone -> {caseId, lastMsgId} on disk so threads survive deploys
+// index.js — WhatsApp ↔ Kayako bridge (thread-safe via RFC headers + subject token)
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -12,6 +9,7 @@ const multer = require('multer');
 const twilio = require('twilio');
 const crypto = require('crypto');
 const fs = require('fs');
+const path = require('path');
 
 dotenv.config();
 
@@ -20,11 +18,11 @@ app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
 // ---------- Config ----------
-const SEND_TO      = process.env.MAIL_TO;                              // hello@stickershop.co.uk
+const SEND_TO      = process.env.MAIL_TO;
 const FROM_DOMAIN  = process.env.MAIL_FROM_DOMAIN || 'whatsapp.stickershop.co.uk';
 const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID;
 const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM || '';          // whatsapp:+44...
+const WA_FROM      = process.env.TWILIO_WHATSAPP_FROM || '';
 
 const KAYAKO_BASE  = (process.env.KAYAKO_BASE_URL || 'https://stickershop.kayako.com').replace(/\/+$/, '');
 const KAYAKO_API   = `${KAYAKO_BASE}/api/v1`;
@@ -37,8 +35,8 @@ const FROM_ALLOW   = (process.env.KAYAKO_FROM_ALLOWLIST || 'hello@stickershop.co
   .filter(Boolean);
 
 const INBOUND_SECRET = process.env.SG_INBOUND_SECRET || '';
-const SERVICE_BASE   = process.env.SERVICE_BASE_URL || ''; // optional absolute origin for file URLs
-const MAP_PATH       = process.env.MAP_PATH || '/data/wa_map.json'; // put this on a Persistent Disk
+const SERVICE_BASE   = process.env.SERVICE_BASE_URL || ''; // optional override
+const MAP_PATH       = process.env.MAP_PATH || '/data/phone_case_map.json'; // persistent map
 
 // SendGrid
 if (!process.env.SENDGRID_API_KEY) console.error('❌ Missing SENDGRID_API_KEY');
@@ -50,24 +48,33 @@ if (!/^whatsapp:\+\d{6,16}$/.test(WA_FROM || '')) {
   console.error('❌ TWILIO_WHATSAPP_FROM must look like "whatsapp:+4479…". Current:', WA_FROM);
 }
 
-// ---------- Tiny persistent store (phone -> { caseId, lastMsgId }) ----------
-function loadStore() {
-  try {
-    const raw = fs.readFileSync(MAP_PATH, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return {};
+// ---------- Persistent phone ➜ {caseId,lastMessageId} map ----------
+let phoneMap = {};
+try {
+  if (fs.existsSync(MAP_PATH)) {
+    phoneMap = JSON.parse(fs.readFileSync(MAP_PATH, 'utf8'));
+    console.log('📇 Map loaded:', MAP_PATH);
   }
+} catch (e) { console.warn('⚠️ Could not load map:', e.message); }
+
+let saveTimer = null;
+function saveMapSoon() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(path.dirname(MAP_PATH), { recursive: true });
+      fs.writeFileSync(MAP_PATH, JSON.stringify(phoneMap, null, 2));
+      // console.log('📇 Map saved:', MAP_PATH);
+    } catch (e) { console.warn('⚠️ Could not save map:', e.message); }
+  }, 200);
 }
-function saveStore() {
-  try {
-    fs.mkdirSync(require('path').dirname(MAP_PATH), { recursive: true });
-    fs.writeFileSync(MAP_PATH, JSON.stringify(store, null, 2));
-  } catch (e) {
-    console.warn('⚠️ Could not persist map file:', e.message);
-  }
+async function mapGet(key) { return phoneMap[key] || null; }
+async function mapSet(key, patch) {
+  const cur = phoneMap[key] || {};
+  phoneMap[key] = { ...cur, ...patch };
+  saveMapSoon();
+  return phoneMap[key];
 }
-let store = loadStore();
 
 // ---------- Helpers ----------
 function kayakoClientOptional() {
@@ -80,11 +87,9 @@ function kayakoClientOptional() {
   });
 }
 
-function digitsFromPhone(wa) {
-  return String(wa || '').replace(/^whatsapp:/, '').replace(/[^\d]/g, '');
-}
-function buildFromAddress(waFrom) {
-  return `${digitsFromPhone(waFrom)}@${FROM_DOMAIN}`;
+function buildFromAddress(phone) {
+  const num = String(phone || '').replace(/^whatsapp:/, '').replace(/^\+/, '');
+  return `${num}@${FROM_DOMAIN}`;
 }
 
 function guessExt(contentType = '') {
@@ -115,6 +120,7 @@ function buildSubjectBase(from) {
   return `WhatsApp message from ${from}`;
 }
 
+// optional seed (first time only)
 async function findLatestOpenCaseIdByIdentity(email) {
   try {
     const client = kayakoClientOptional();
@@ -145,53 +151,48 @@ function firstAddress(str = '') {
 }
 
 function toWhatsAppNumber(toField = '', envelope = '') {
-  // Prefer RCPT TO from the envelope
+  // Try RCPT TO from SendGrid's envelope first
   try {
     const env = JSON.parse(envelope || '{}');
     const arr = Array.isArray(env.to) ? env.to : (env.to ? [env.to] : []);
-    const to  = arr.find(a => String(a).toLowerCase().endsWith(`@${FROM_DOMAIN}`)) || arr[0] || '';
+    const to = arr.find(a => String(a).toLowerCase().endsWith(`@${FROM_DOMAIN}`)) || arr[0] || '';
     const digits = String((to || '').split('@')[0]).replace(/\D/g, '');
     return digits ? `whatsapp:+${digits}` : null;
   } catch { /* ignore */ }
 
-  // Fallback to parsed "To:"
+  // Fallback to the "to" header
   const addr = firstAddress(toField);
   const digits = String((addr || '').split('@')[0]).replace(/\D/g, '');
   return digits ? `whatsapp:+${digits}` : null;
 }
 
-function normalizeMsgId(s) {
-  if (!s) return null;
-  const inner = String(s).trim().replace(/^<|>$/g, '');
-  return inner ? `<${inner}>` : null;
+function extractMessageId(headersStr = '') {
+  const m = String(headersStr).match(/^message-id:\s*<([^>]+)>/im);
+  return m ? `<${m[1]}>` : null; // keep angle brackets
 }
 
 // ---------- WhatsApp -> Kayako (email via SendGrid) ----------
 app.post('/incoming-whatsapp', async (req, res) => {
-  const from = req.body.From || '';
+  const waFrom = req.body.From || '';            // "whatsapp:+4479…"
   const caption = (req.body.Body || '').trim();
   const numMedia = parseInt(req.body.NumMedia || '0', 10) || 0;
 
-  const phone = digitsFromPhone(from);
-  console.log(`📩 WhatsApp from ${from} TO ${WA_FROM}: ${caption || '(no text)'} — media: ${numMedia}`);
+  console.log(`📩 WhatsApp from ${waFrom}: ${caption || '(no text)'} — media: ${numMedia}`);
 
-  const fromEmail = buildFromAddress(from);
+  const fromEmail = buildFromAddress(waFrom);
 
-  // Prefer a stored caseId; if missing, try the API; then persist.
-  let mapped = store[phone] || {};
-  if (!mapped.caseId) {
-    const found = await findLatestOpenCaseIdByIdentity(fromEmail);
-    if (found) {
-      mapped.caseId = found;
-      mapped.updatedAt = Date.now();
-      store[phone] = mapped; saveStore();
-    }
+  // look up per-number mapping
+  let mapRow = await mapGet(waFrom);
+
+  // optional: if we have no caseId yet, seed from Kayako (first time only)
+  if (!mapRow?.caseId) {
+    const seedId = await findLatestOpenCaseIdByIdentity(fromEmail);
+    if (seedId) mapRow = await mapSet(waFrom, { caseId: seedId });
   }
 
-  // Collect attachments
+  // Collect media
   const attachments = [];
   let totalBytes = 0;
-
   for (let i = 0; i < numMedia; i++) {
     const url  = req.body[`MediaUrl${i}`];
     const type = req.body[`MediaContentType${i}`] || 'application/octet-stream';
@@ -205,8 +206,14 @@ app.post('/incoming-whatsapp', async (req, res) => {
         continue;
       }
       const ext      = guessExt(type);
-      const filename = `${phone}-wa-${i + 1}${ext}`;
-      attachments.push({ content: buf.toString('base64'), filename, type, disposition: 'attachment' });
+      const safeNum  = waFrom.replace(/\D/g, '');
+      const filename = `${safeNum}-wa-${i + 1}${ext}`;
+      attachments.push({
+        content: buf.toString('base64'),
+        filename,
+        type,
+        disposition: 'attachment'
+      });
     } catch (err) {
       console.error(`❌ Failed to fetch media ${i}:`, err.response?.status || err.message);
     }
@@ -215,27 +222,26 @@ app.post('/incoming-whatsapp', async (req, res) => {
   const bodyText =
     caption ||
     (attachments.length
-      ? `WhatsApp message from ${from} with ${attachments.length} attachment(s).`
+      ? `WhatsApp message from ${waFrom} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
-  const subject = mapped.caseId
-    ? `${buildSubjectBase(from)} [Case #${mapped.caseId}]`
-    : buildSubjectBase(from);
+  // Build subject + RFC headers for threading
+  const subject = mapRow?.caseId
+    ? `${buildSubjectBase(waFrom)} [Case #${mapRow.caseId}]`
+    : buildSubjectBase(waFrom);
 
-  // Build headers; if we have the latest Kayako Message-ID for this phone,
-  // use it to force threading.
   const headers = {
     'Auto-Submitted': 'auto-generated',
     'X-Loop-Prevent': 'whatsapp-bridge'
   };
-  if (mapped.lastMsgId) {
-    headers['In-Reply-To'] = normalizeMsgId(mapped.lastMsgId);
-    headers['References']  = normalizeMsgId(mapped.lastMsgId);
+  if (mapRow?.lastMessageId) {
+    headers['In-Reply-To'] = mapRow.lastMessageId;
+    headers['References']  = mapRow.lastMessageId;
   }
 
   const msg = {
     to: SEND_TO,
-    from: { email: fromEmail, name: from }, // appear as the customer
+    from: { email: fromEmail, name: waFrom },
     subject,
     text: bodyText,
     attachments,
@@ -252,11 +258,11 @@ app.post('/incoming-whatsapp', async (req, res) => {
   }
 });
 
-// ---------- Temporary file hosting for WhatsApp media ----------
+// ---------- Temporary file hosting for WhatsApp media (Kayako → WA) ----------
 const upload = multer({ storage: multer.memoryStorage() });
-const FILE_TTL_MS = 20 * 60 * 1000;         // 20 minutes
-const MAX_MEDIA_BYTES = 10 * 1024 * 1024;   // per file safeguard (10MB)
-const memStore = new Map();                 // id -> {buf,type,name,exp}
+const FILE_TTL_MS = 20 * 60 * 1000; // 20 mins
+const MAX_MEDIA_BYTES = 10 * 1024 * 1024;
+const memStore = new Map(); // id -> {buf,type,name,exp}
 
 setInterval(() => {
   const now = Date.now();
@@ -266,9 +272,8 @@ setInterval(() => {
 function storeTempFile(buffer, type, name) {
   const id = crypto.randomBytes(16).toString('hex');
   memStore.set(id, { buf: buffer, type: type || 'application/octet-stream', name: name || 'file', exp: Date.now() + FILE_TTL_MS });
-  const base = SERVICE_BASE || process.env.RENDER_EXTERNAL_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '';
-  const origin = base || '';
-  return `${origin}${origin.endsWith('/') ? '' : ''}/file/${id}`;
+  const base = SERVICE_BASE || process.env.RENDER_EXTERNAL_URL || '';
+  return `${base}${base.endsWith('/') ? '' : ''}/file/${id}`;
 }
 
 app.get('/file/:id', (req, res) => {
@@ -279,41 +284,42 @@ app.get('/file/:id', (req, res) => {
   res.send(v.buf);
 });
 
-// ---------- Email cleaning ----------
+// ---------- Email body cleaning ----------
 function stripQuotedAndSignature(txt) {
   if (!txt) return '';
   let s = String(txt).replace(/\r\n/g, '\n');
 
-  // remove quoted history
+  // remove quoted '>'
   s = s.split('\n').filter(l => !/^\s*>/.test(l)).join('\n');
 
-  // cut at “On … wrote:”
+  // "On … wrote:"
   const wroteIdx = s.search(/^\s*On .+ wrote:\s*$/im);
   if (wroteIdx !== -1) s = s.slice(0, wroteIdx);
 
-  // cut at From/Sent/To/Subject header block
+  // header-ish blocks
   const hdrIdx = s.search(/^\s*(From|Sent|To|Subject):\s/im);
   if (hdrIdx !== -1) s = s.slice(0, hdrIdx);
 
-  // long separator lines
+  // long separator lines (10+ of -, =, _, en dash, em dash)
   const sepMatch = s.match(/^[\t ]*(?:[-=–—_]){10,}[\t ]*$/m);
   if (sepMatch) s = s.slice(0, sepMatch.index);
 
-  // phone/email/web “fields”
+  // business-card lines (t./m./e./w.)
   const fieldsMatch = s.match(/^\s*(?:t\.|m\.|e\.|w\.)\s+/im);
   if (fieldsMatch) s = s.slice(0, fieldsMatch.index);
 
-  // legal / disclaimers
+  // legal boilerplate
   const legalIdx = s.search(
     /(registered address|company\s*(no|number)|confidential(ity)? notice|this message (is|may be) confidential|please consider the environment)/i
   );
   if (legalIdx !== -1) s = s.slice(0, legalIdx);
 
-  // strip stray [img ...] blocks
+  // stray [img ...]
   s = s.replace(/\[img[\s\S]*?\]/gi, ' ');
 
-  // company-specific footers
-  for (const rx of [/stickershop is a trading division/i, /theprintshop ltd/i]) {
+  // company-specific nukes
+  const killPhrases = [/stickershop is a trading division/i, /theprintshop ltd/i];
+  for (const rx of killPhrases) {
     const i = s.search(rx);
     if (i !== -1) { s = s.slice(0, i); break; }
   }
@@ -334,8 +340,8 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
       }
     }
 
-    const { from, to, envelope, subject } = req.body || {};
-    let { text, html, headers } = req.body || {};
+    const { from, to, envelope, subject, headers: rawHeaders } = req.body || {};
+    let { text, html } = req.body || {};
 
     const fromAddr = firstAddress(from);
     if (FROM_ALLOW.length && !FROM_ALLOW.includes(fromAddr)) {
@@ -348,28 +354,19 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
       console.log('⛔️ Could not derive WhatsApp number from:', to, envelope);
       return res.status(200).send('no-to');
     }
-    const phone = digitsFromPhone(waTo);
 
-    // Extract Message-ID and Case # from raw headers string
-    let lastMsgId = null;
-    let caseIdFromSubj = null;
-    try {
-      const raw = String(headers || '');
-      const mid = raw.match(/^\s*Message-Id:\s*<([^>]+)>/im) || raw.match(/^\s*Message-ID:\s*<([^>]+)>/im);
-      if (mid) lastMsgId = `<${mid[1].trim()}>`;
-    } catch {}
-    const mCase = String(subject || '').match(/\[Case\s*#(\d+)\]/i);
-    if (mCase) caseIdFromSubj = parseInt(mCase[1], 10);
+    // capture Case # and Message-ID for threading on next inbound email
+    const caseIdMatch = (subject || '').match(/\[Case\s*#(\d+)\]/i);
+    const caseId = caseIdMatch ? caseIdMatch[1] : null;
+    const messageId = extractMessageId(rawHeaders || '');
 
-    // Persist threading hints
-    store[phone] = {
-      caseId: caseIdFromSubj || (store[phone] && store[phone].caseId) || null,
-      lastMsgId: lastMsgId || (store[phone] && store[phone].lastMsgId) || null,
-      updatedAt: Date.now()
-    };
-    saveStore();
+    let row = await mapGet(waTo);
+    row = await mapSet(waTo, {
+      caseId: caseId || row?.caseId || null,
+      lastMessageId: messageId || row?.lastMessageId || null
+    });
 
-    // Build WhatsApp body (cleaned)
+    // build clean body
     let body = (text || '').trim();
     if (!body && html) {
       body = String(html)
@@ -382,7 +379,7 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
     body = stripQuotedAndSignature(body);
     if (!body) body = '(no text)';
 
-    // Decide which attachments to forward (ignore inline signature images)
+    // choose attachments to forward (skip inline)
     const mediaUrls = [];
     let info = {};
     try { info = JSON.parse(req.body['attachment-info'] || '{}'); } catch {}
@@ -394,10 +391,7 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
     for (const f of req.files || []) {
       const name = (f.originalname || 'file').toLowerCase();
       if (inlineNames.has(name)) continue;
-      if (f.size > MAX_MEDIA_BYTES) {
-        console.warn('⚠️ Skipping large attachment:', name, f.size);
-        continue;
-      }
+      if (f.size > MAX_MEDIA_BYTES) { console.warn('⚠️ Skipping large attachment:', name, f.size); continue; }
       const url = storeTempFile(f.buffer, f.mimetype, f.originalname);
       mediaUrls.push(url);
       if (mediaUrls.length >= 10) break; // Twilio limit
