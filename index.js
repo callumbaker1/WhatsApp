@@ -200,9 +200,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       ? `WhatsApp message from ${from} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
-  const subject = existingCaseId
-    ? `${buildSubjectBase(from)} [Case #${existingCaseId}]`
-    : buildSubjectBase(from);
+  const subject = buildSubjectBase(from);
 
   // --- Header threading: Add In-Reply-To/References to last Message-ID we sent for this number ---
   const threadMap = loadThreadMap();
@@ -420,4 +418,4 @@ app.post('/sg-inbound', upload.any(), async (req, res) => {
 app.get('/', (_req, res) => res.send('Webhook is running ✅'));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Webhook server running on port ${PORT}`)); 
