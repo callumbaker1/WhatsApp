@@ -200,7 +200,8 @@ app.post('/incoming-whatsapp', async (req, res) => {
       ? `WhatsApp message from ${from} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
-  const subject = buildSubjectBase(from);
+  const subject = `${buildSubjectBase(from)} [Case #123456]`
+    
 
   // --- Header threading: Add In-Reply-To/References to last Message-ID we sent for this number ---
   const threadMap = loadThreadMap();
