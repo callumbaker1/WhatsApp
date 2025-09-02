@@ -232,9 +232,7 @@ app.post('/incoming-whatsapp', async (req, res) => {
       ? `WhatsApp message from ${from} with ${attachments.length} attachment(s).`
       : 'WhatsApp message (no text).');
 
-  const subject = existingCaseId
-    ? `${buildSubjectBase(from)} [Case #${existingCaseId}]`
-    : buildSubjectBase(from);
+  const subject = buildSubjectBase(from);
 
   // Threading: get the last message-id anchor for this phone
   const phoneKey = from.replace(/\D/g, '');
