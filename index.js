@@ -165,7 +165,9 @@ app.post('/incoming-whatsapp', async (req, res) => {
 
   // Optional: include case in subject (only a hint; threading is via headers)
   const caseIdHint = prev.caseId || await findLatestOpenCaseIdByIdentity(fromEmail);
-  const subject = buildSubjectBase(waFrom);
+  const subject = caseIdHint
+    ? `${buildSubjectBase(waFrom)} [Case #123123]`
+    : buildSubjectBase(waFrom);
 
   // Build attachments
   const attachments = [];
